@@ -5,3 +5,7 @@ einops
 torch
 bitsandbytes
 accelerate
+compressed-tensors
+fla-core
+# flash-attn
+tiktoken
