@@ -43,7 +43,7 @@ The attention term is the one that bites on long prompts. sdpa and flash-attenti
 ### Massive activations
 Some models grow a handful of hidden dimensions three orders of magnitude larger than the rest, from one layer onwards. Qwen3-14B goes from 85 to 11,776 at layer 20. A large dimension has a large variance, so the difference between the two class means is large there too — 94% of the whole difference vector — while its t is 2.2, which is to say it is sampling noise. The direction then points at that dimension instead of at refusal, and agreement between two halves of the prompts collapses from 0.94 to 0.19. Nothing fails: the separation over the prompts the direction was built from reads 150, which looks excellent.
 
-`DROP_LARGEST_DIMENSIONS` (0 by default) zeroes that many dimensions, chosen by activation magnitude, before the difference is normalised into the direction. Measured effect on the train/test agreement of the direction:
+`DROP_LARGEST_DIMENSIONS` (1 by default) zeroes that many dimensions, chosen by activation magnitude, before the difference is normalised into the direction. Measured effect on the train/test agreement of the direction:
 
 | | Qwen3-14B L24 | Qwen3-14B L19 | Qwen3-8B L25 | Qwen3.5-9B L21 |
 |---|---|---|---|---|

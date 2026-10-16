@@ -8,7 +8,7 @@ from model_loading import get_decoder_layers, get_input_device, load_model
 
 torch.inference_mode()
 
-MODEL_ID = "../Kimi-K3"
+MODEL_ID = "../Hy-Memory-30B-A3B"
 # MODEL_ID = "tiiuae/Falcon3-1B-Instruct"
 # MODEL_ID = "Qwen/Qwen3-1.7B"
 # MODEL_ID = "stabilityai/stablelm-2-zephyr-1_6b"

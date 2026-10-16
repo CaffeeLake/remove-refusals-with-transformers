@@ -11,7 +11,7 @@ from model_loading import (format_duration, get_decoder_layers,
 
 torch.inference_mode()
 
-MODEL_ID = "../Kimi-K3"
+MODEL_ID = "../Hy-Memory-30B-A3B"
 # MODEL_ID = "tiiuae/Falcon3-1B-Instruct"
 # MODEL_ID = "Qwen/Qwen3-1.7B"
 # MODEL_ID = "stabilityai/stablelm-2-zephyr-1_6b"
@@ -63,10 +63,24 @@ CPU_LIMIT = None
 # which offloads roughly four times as much to CPU RAM.
 KEEP_PACKED = True
 
-# How deep into the model the refusal direction is read from. 0.6 is where the
-# residual stream has usually settled into features but has not yet started
-# turning back into logits.
-LAYER_FRACTION = 0.6
+# How deep into the model the refusal direction is read from. 0.6 is the constant
+# the upstream repo inherited; this is the measured one. choose_layer.py puts the
+# optimum on Hy-Memory-30B-A3B at 0.71 (layer 34 of 48) and keeps putting it
+# there: 0.69, 0.71, 0.71 and 0.73 over four independent counts of excluded
+# dimensions in one run, and 0.69, 0.71, 0.73 over three runs at three prompt
+# counts. Against layer 28, which is what 0.6 selects:
+#
+#     layer 28 (0.6 ): effect size 7.02, explains 35.2% of the difference at
+#                      every layer
+#     layer 34 (0.71): effect size 7.56, explains 39.1%
+#
+# Both are inside the effect-size plateau -- 16 of the 43 layers swept are, which
+# is why the second number is what decides between them -- but 0.6 sits on the
+# shallow side of where the direction is actually sharpest, and nothing argues
+# for it except that it was already written down. 0.80 is where generation starts
+# to degrade on the models that were checked against it, so 0.71 is not near the
+# other edge.
+LAYER_FRACTION = 0.71
 
 # Build only the layers up to the one the activation is read from. Everything
 # after it is never executed -- the capture hook aborts the forward pass -- so
@@ -85,7 +99,19 @@ TRUNCATE_LAYERS = True
 # direction can never remove all of it). 32 also has a long tail -- one draw in
 # twenty leaves nearly half of it. The cost is linear in forward passes and the
 # capture hook aborts each one at LAYER_FRACTION, so this is cheap.
-instructions = 512
+#
+# harmful.txt holds 1040 prompts, so 1024 is as far as this can go: `random.sample`
+# raises above the population size, and at 1024 the harmful draw is 98% of the
+# file either way. The harmless side comes from 63622.
+instructions = 1024
+
+# Without a seed the saved direction is a different vector every run, so nothing
+# downstream -- the ablated checkpoint, the layer choose_layer.py reported, a
+# comparison between two runs -- refers to anything fixed. Note that sharing this
+# seed with choose_layer.py does not make the two scripts draw the same prompts:
+# `random.sample(population, k)` is a different draw for a different `k`, and
+# that script samples 512. Set both to the same count for that.
+random.seed(1)
 # Dimensions excluded from the difference before it is normalised into the
 # direction, chosen by activation magnitude. Some models develop a handful of
 # dimensions three orders of magnitude larger than the rest from some layer on
@@ -98,7 +124,7 @@ instructions = 512
 # models that do not have the problem: 0.938 -> 0.937 on Qwen3-14B's own layer
 # 19, 0.886 -> 0.889 on Qwen3-8B, 0.850 -> 0.850 on Qwen3.5-9B. Raising it past 2
 # changes nothing either (flat from 2 to 128); 0 turns it off.
-DROP_LARGEST_DIMENSIONS = 0
+DROP_LARGEST_DIMENSIONS = 1
 
 # Share of the prompts kept out of the direction and used only to check it. The
 # saved direction is still built from all of them; this only buys the honest

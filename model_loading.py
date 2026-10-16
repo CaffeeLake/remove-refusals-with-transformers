@@ -30,12 +30,22 @@ loaded, which is the most expensive moment to fail at:
    "Cannot copy out of meta tensor". `get_input_device` returns the device the
    embeddings actually execute on.
 
-A fifth problem is not about size at all, but has to be solved in the same place
-because it happens even earlier: an llmcompressor export can leave a `targets`
-regex that selects containers and norms as well as the Linears it packed, and
-compressed-tensors then refuses the checkpoint outright with "Quantization of
-module type ... is not supported". `repair_quantization_targets` narrows the
-regex before `from_pretrained` sees it.
+Two further problems are not about size at all, but have to be solved in the same
+place because they happen even earlier, while the config is being turned into
+modules:
+
+5. An llmcompressor export can leave a `targets` regex that selects containers
+   and norms as well as the Linears it packed, and compressed-tensors then
+   refuses the checkpoint outright with "Quantization of module type ... is not
+   supported". `repair_quantization_targets` narrows the regex before
+   `from_pretrained` sees it.
+
+6. A checkpoint can ship a config that no longer describes its own weights --
+   Hy-Memory-30B-A3B gives its expert width as `expert_hidden_dim`, a name the
+   installed transformers does not read, and the `moe_intermediate_size` it does
+   read is left at a default twice the real value. Transformers then builds
+   experts of the wrong shape and refuses the load. `repair_expert_width`
+   measures the width from the checkpoint's own shapes and corrects the config.
 """
 
 import faulthandler
@@ -56,8 +66,10 @@ __all__ = [
     "get_decoder_layers",
     "get_input_device",
     "build_max_memory",
+    "unified_memory",
     "keep_weights_packed",
     "pin_tiny_offloaded_modules",
+    "promote_offloaded_modules",
     "layer_count",
     "truncate_layers",
     "kv_cache_bytes",
@@ -74,8 +86,12 @@ __all__ = [
     "narrow_targets",
     "ignore_dense_targets",
     "checkpoint_tensor_names",
+    "checkpoint_tensor_shapes",
     "checkpoint_tensor_sizes",
+    "tensor_sizes",
     "checkpoint_footprint",
+    "expert_width",
+    "repair_expert_width",
     "repair_quantization_targets",
     "parse_memory",
     "format_memory",
@@ -257,6 +273,16 @@ def truncate_layers(config, keep):
         for key in _LAYER_COUNT_KEYS:
             if getattr(candidate, key, None):
                 setattr(candidate, key, keep)
+        # Per-layer lists have to be shortened with it, or they describe a model
+        # with more layers than the one being built. Truncating keeps every
+        # remaining layer's own entry: an architecture that alternates
+        # (`layer_types` for sliding-window attention, `mlp_layer_types` for the
+        # dense-then-sparse MoE pattern) would otherwise be rebuilt wrong if
+        # anything downstream re-derived the list from its length.
+        for key, value in list(vars(candidate).items()):
+            if key.endswith("layer_types") and isinstance(value, list) \
+                    and len(value) == total:
+                setattr(candidate, key, value[:keep])
     return total - keep
 
 
@@ -531,8 +557,13 @@ def checkpoint_tensor_names(model_id):
 _LAYER_INDEX = re.compile(r"\.(?:layers|h|blocks|block)\.(\d+)\.")
 
 
-def checkpoint_tensor_sizes(model_id):
-    """{tensor name: bytes}, read from the safetensors headers and nothing else.
+_DTYPE_WIDTHS = {"BOOL": 1, "U8": 1, "I8": 1, "F8_E4M3": 1, "F8_E5M2": 1,
+                 "BF16": 2, "F16": 2, "I16": 2, "U16": 2, "F32": 4, "I32": 4,
+                 "U32": 4, "F64": 8, "I64": 8, "U64": 8}
+
+
+def checkpoint_tensor_shapes(model_id):
+    """{tensor name: (shape, safetensors dtype)}, from the headers and nothing else.
 
     Empty when the checkpoint is not a local directory: the shard index lists the
     names but not the shapes, and the headers are not worth a download.
@@ -543,19 +574,29 @@ def checkpoint_tensor_sizes(model_id):
 
     from safetensors import safe_open
 
-    widths = {"BOOL": 1, "U8": 1, "I8": 1, "F8_E4M3": 1, "F8_E5M2": 1,
-              "BF16": 2, "F16": 2, "I16": 2, "U16": 2, "F32": 4, "I32": 4,
-              "U32": 4, "F64": 8, "I64": 8, "U64": 8}
-    sizes = {}
+    shapes = {}
     for shard in sorted(directory.glob("*.safetensors")):
         with safe_open(shard, framework="pt") as handle:
             for name in handle.keys():
                 view = handle.get_slice(name)
-                count = 1
-                for dimension in view.get_shape():
-                    count *= dimension
-                sizes[name] = count * widths.get(view.get_dtype(), 2)
+                shapes[name] = (tuple(view.get_shape()), view.get_dtype())
+    return shapes
+
+
+def tensor_sizes(shapes):
+    """{tensor name: bytes} for the output of `checkpoint_tensor_shapes`."""
+    sizes = {}
+    for name, (shape, dtype) in shapes.items():
+        count = 1
+        for dimension in shape:
+            count *= dimension
+        sizes[name] = count * _DTYPE_WIDTHS.get(dtype, 2)
     return sizes
+
+
+def checkpoint_tensor_sizes(model_id):
+    """{tensor name: bytes}, read from the safetensors headers and nothing else."""
+    return tensor_sizes(checkpoint_tensor_shapes(model_id))
 
 
 def checkpoint_footprint(sizes, max_layers=None):
@@ -579,6 +620,114 @@ def checkpoint_footprint(sizes, max_layers=None):
             resident += size
             per_layer[layer] = per_layer.get(layer, 0) + size
     return resident, max(per_layer.values(), default=0)
+
+
+# A routed expert's three projections, whether the checkpoint stores them per
+# expert (`mlp.experts.7.gate_proj.weight`) or fused across the experts
+# (`mlp.experts.gate_up_proj`). `(?:^|\.)` keeps `shared_experts` out: the shared
+# expert is a different width in several architectures (a multiple of the routed
+# one), so it cannot be used to measure the routed width.
+_EXPERT_PROJECTION = re.compile(
+    r"(?:^|\.)experts(?:\.\d+)?\."
+    r"(gate_up_proj|gate_proj|up_proj|down_proj|w1|w2|w3)(?:\.weight)?$")
+
+_EXPERT_COUNT_KEYS = ("num_experts", "n_routed_experts", "num_local_experts",
+                      "num_routed_experts", "moe_num_experts")
+
+_EXPERT_WIDTH_KEYS = ("moe_intermediate_size", "expert_hidden_dim",
+                      "expert_intermediate_size", "moe_ffn_hidden_size")
+
+
+def expert_width(shapes, hidden, experts=None):
+    """The per-expert intermediate width the checkpoint was written with.
+
+    Measured from the shapes rather than trusted from the config, because that is
+    the one thing a stale config cannot lie about. Every routed-expert projection
+    has the residual stream on one side and the expert's intermediate width on
+    the other, so the width is whichever dimension is not `hidden` -- which also
+    makes this independent of the transposition each architecture happens to
+    store, and of whether the experts are fused into one tensor or not.
+
+    None when the checkpoint has no routed experts, or when the ones it has do
+    not agree on a single width.
+    """
+    widths = set()
+    for name, (shape, _) in shapes.items():
+        match = _EXPERT_PROJECTION.search(name)
+        if match is None:
+            continue
+        dimensions = list(shape)
+        if len(dimensions) == 3:
+            # Fused across the experts: one of the three axes is the expert
+            # count. Without knowing it there is no telling which, so leave the
+            # tensor alone rather than guess.
+            if experts and experts in dimensions:
+                dimensions.remove(experts)
+            else:
+                continue
+        if len(dimensions) != 2 or not hidden:
+            continue
+        if dimensions[0] == hidden and dimensions[1] == hidden:
+            width = hidden
+        elif dimensions[0] == hidden:
+            width = dimensions[1]
+        elif dimensions[1] == hidden:
+            width = dimensions[0]
+        else:
+            continue            # not a projection off the residual stream
+        if match.group(1) == "gate_up_proj":
+            if width % 2:
+                continue
+            width //= 2         # gate and up concatenated
+        widths.add(width)
+    return widths.pop() if len(widths) == 1 else None
+
+
+def repair_expert_width(config, shapes):
+    """Fix a config whose MoE expert width disagrees with the checkpoint's.
+
+    A checkpoint written against one version of an architecture's config class and
+    loaded with another can carry the expert width under a name the installed
+    transformers no longer reads -- Hy-Memory-30B-A3B stores
+    `expert_hidden_dim: 768` next to a `moe_intermediate_size: 1536` that nothing
+    produced, and transformers builds 1536-wide experts for 768-wide weights. The
+    load then fails with a wall of `MISMATCH` lines, or, with
+    `ignore_mismatched_sizes=True`, succeeds and leaves every expert randomly
+    initialised.
+
+    The config is mutated in place; pass the same `config` object to
+    `from_pretrained` for the repair to take effect. Returns True when something
+    was changed.
+    """
+    text_config = _text_config(config)
+    declared = getattr(text_config, "moe_intermediate_size", None)
+    if not isinstance(declared, int) or isinstance(declared, bool):
+        # Not an architecture with a single scalar expert width (some configs use
+        # a per-layer list), so there is nothing here to compare.
+        return False
+
+    hidden = getattr(text_config, "hidden_size", 0) or 0
+    experts = next((getattr(text_config, key) for key in _EXPERT_COUNT_KEYS
+                    if getattr(text_config, key, None)), None)
+    width = expert_width(shapes, hidden, experts)
+    if width is None or width == declared:
+        return False
+
+    for candidate in {id(text_config): text_config, id(config): config}.values():
+        if getattr(candidate, "moe_intermediate_size", None) is not None:
+            candidate.moe_intermediate_size = width
+
+    # Name the key the width was actually shipped under, when there is one; it is
+    # the difference between "the config is stale" and "the checkpoint is odd".
+    alias = next((key for key in _EXPERT_WIDTH_KEYS
+                  if key != "moe_intermediate_size"
+                  and getattr(text_config, key, None) == width), None)
+    print(f"Set `moe_intermediate_size` to {width}: the config says {declared} "
+          f"but the checkpoint's expert weights are {width} wide"
+          + (f" (it ships that as `{alias}`, which this version of transformers "
+             "does not read)" if alias else "")
+          + ". Left alone, every expert would be reinitialised with noise.")
+    return True
 
 
 def repair_quantization_targets(model_id, config):
@@ -710,6 +859,42 @@ def _available_cpu_memory():
         return 0
 
 
+def unified_memory(devices=None):
+    """Whether every visible GPU's memory *is* the system's RAM.
+
+    True on an integrated GPU -- Jetson, Grace Hopper, GB10 -- where CUDA reports
+    the whole machine as the card's memory. It breaks the assumption the rest of
+    this module is built on: `max_memory[device]` and `max_memory["cpu"]` are
+    then not two pools but one, so handing out the free VRAM *and* most of the
+    free RAM promises the machine twice over, and offloading a block to the CPU
+    frees nothing at all because it stays in the same memory.
+    """
+    if devices is None:
+        devices = list(range(torch.cuda.device_count()))
+    if not devices:
+        return False
+    return all(getattr(torch.cuda.get_device_properties(device),
+                       "is_integrated", 0) for device in devices)
+
+
+# What a load of W bytes of weights takes out of a unified pool *while it runs*:
+# the weights at their destination, plus the host-side copy every tensor is read
+# and converted through, which is anonymous memory and is not handed back until
+# the load finishes. Measured on a GB10 (121.6GiB of unified memory) loading
+# 33.8GiB of this checkpoint: 71.4GiB peak, 2.11x, settling back to 1.14x once
+# the load returned. It is not accelerate's per-tensor `empty_cache()` -- leaving
+# that in place measures 2.16x and is 13s slower -- and with no swap none of it
+# is reclaimable, so over-committing it does not get a MemoryError, it gets the
+# process SIGKILLed partway through the load. 56.0GiB of weights died at 96%;
+# 51.3GiB on the same machine completed.
+UNIFIED_LOAD_PEAK = 2.2
+
+# The host-side share of that: 1.11x measured, rounded up. It is what a byte
+# costs the pool if it is *left* on the host instead of being placed on a device,
+# since then the copy it was read through is where it stays.
+UNIFIED_HOST_COPY = 1.2
+
+
 def build_max_memory(config, tokens, headroom=None, headroom_fraction=0.1,
                      cpu_limit=None, weight_growth=1.0, sequence=None,
                      weights=0, onload=0):
@@ -724,6 +909,10 @@ def build_max_memory(config, tokens, headroom=None, headroom_fraction=0.1,
 
     Spending VRAM on the reserve pushes more weights to CPU RAM, which costs
     throughput but is the only way the run finishes at all.
+
+    On a machine where the GPU memory *is* the system memory none of that split
+    exists, and the budget becomes one pool that also has to hold the load's own
+    working set; see `unified_memory` and `UNIFIED_LOAD_PEAK`.
     """
     kv_cache = kv_cache_bytes(config, tokens)
     activations = activation_bytes(config, tokens)
@@ -735,6 +924,12 @@ def build_max_memory(config, tokens, headroom=None, headroom_fraction=0.1,
 
     devices = list(range(torch.cuda.device_count()))
     shards = max(len(devices), 1)
+    unified = unified_memory(devices)
+    # `mem_get_info`'s free figure leaves out reclaimable page cache, which on a
+    # unified machine is most of what a previous run left behind: it read 71.4GiB
+    # of free memory where MemAvailable said 114.8GiB, and the cache did get
+    # evicted. They measure the same RAM, so take the larger of the two.
+    system_available = _available_cpu_memory() if unified else 0
 
     # A GPU runs one layer at a time, so it needs a full layer's activations and
     # a full weight's unpacking workspace no matter how few layers it holds;
@@ -744,19 +939,36 @@ def build_max_memory(config, tokens, headroom=None, headroom_fraction=0.1,
     # holds the KV cache of all of them.
     reserve_0 = activations + workspace + attention + kv_cache
 
+    def free_memory(device):
+        free, total = torch.cuda.mem_get_info(device)
+        return max(free, system_available), total
+
+    def device_headroom_for(device, total, extra):
+        if headroom is not None:
+            return parse_memory(headroom)
+        # The fraction of the card is the backstop for everything the terms
+        # above do not model: cuBLAS workspaces, NCCL buffers, allocator
+        # fragmentation.
+        return max(int(headroom_fraction * total),
+                   (reserve_0 if device == 0 else reserve) + extra)
+
     def budgets(extra):
         out = {}
         for device in devices:
-            free, total = torch.cuda.mem_get_info(device)
-            if headroom is not None:
-                device_headroom = parse_memory(headroom)
-            else:
-                # The fraction of the card is the backstop for everything the
-                # terms above do not model: cuBLAS workspaces, NCCL buffers,
-                # allocator fragmentation.
-                device_headroom = max(int(headroom_fraction * total),
-                                      (reserve_0 if device == 0 else reserve) + extra)
-            out[device] = max(0, int((free - device_headroom) / weight_growth))
+            free, total = free_memory(device)
+            device_headroom = device_headroom_for(device, total, extra)
+            budget = (free - device_headroom) / weight_growth
+            if unified:
+                # One pool, shared with every other device and with the copies
+                # the load reads its tensors through -- but not at the same
+                # time as the forward pass's reserve: those copies are handed
+                # back before there is a KV cache to hold (process RSS fell from
+                # a 34.6GiB peak to 878MiB when the load returned). So the two
+                # constraints bind separately and the tighter one wins, rather
+                # than adding up.
+                budget = min(budget, free / UNIFIED_LOAD_PEAK / weight_growth)
+                budget /= shards
+            out[device] = max(0, int(budget))
         return out
 
     max_memory = budgets(0)
@@ -769,8 +981,45 @@ def build_max_memory(config, tokens, headroom=None, headroom_fraction=0.1,
     if offloading and onload:
         max_memory = budgets(onload)
 
+    # On one shared pool, weights that do not fit the device budget are not out
+    # of memory -- they are on the wrong side of it. A byte placed on a device
+    # costs the pool `UNIFIED_LOAD_PEAK` while the load runs (its destination,
+    # plus the host copy it is read and converted through); a byte left on the
+    # host costs `UNIFIED_HOST_COPY`, because that copy *is* its destination. So
+    # putting *less* on the device is what makes a bigger model fit, and on this
+    # kind of machine it is nearly free at runtime: "CPU RAM" is the same memory
+    # and onloading a block is a RAM-to-RAM copy, not a PCIe transfer. Without
+    # this, a 56GiB checkpoint on a 121.6GiB machine has nowhere to go.
+    host_resident = 0
+    if unified and weights and sum(max_memory.values()) < weights:
+        free, total = free_memory(devices[0])
+        spare = max(0, free - device_headroom_for(devices[0], total,
+                                                  onload if offloading else 0))
+        # A split that adds up to exactly the weights is not enough. accelerate
+        # places whole decoder layers and counts buffers this does not, so with
+        # no slack the last layer finds both budgets full and goes to *disk* --
+        # which for a MoE checkpoint fails outright ("the model uses an internal
+        # weight format different than the one saved"), and when it does not
+        # fail it is a per-forward read from a filesystem. Hold back a tenth of
+        # a device's worth so the host budget is strictly larger than what is
+        # left for it to hold.
+        on_device = max(0, min(int(spare - UNIFIED_HOST_COPY * weights), weights))
+        on_device = int(on_device * 0.9)
+        host_room = int((spare - UNIFIED_LOAD_PEAK * on_device) / UNIFIED_HOST_COPY)
+        # Not `weights - on_device`: the whole of what the pool can still take,
+        # so that accelerate has somewhere to round up into.
+        host_resident = max(0, host_room)
+        for device in devices:
+            max_memory[device] = int(on_device / shards / weight_growth)
+
     if cpu_limit is not None:
         max_memory["cpu"] = parse_memory(cpu_limit)
+    elif unified:
+        # Either what the split above worked out, or -- when the weights fit the
+        # devices outright -- nothing, because this is the same memory and a
+        # block left on the host still has to be copied to its execution device
+        # on every forward pass.
+        max_memory["cpu"] = host_resident if host_resident > 2 ** 20 else 0
     else:
         # Offloaded weights are held in ordinary (non-pinned) RAM, and the
         # process needs some of it for itself: the shards are read through it,
@@ -788,12 +1037,47 @@ def build_max_memory(config, tokens, headroom=None, headroom_fraction=0.1,
               f"{format_memory(workspace)} to unpack a weight through, "
               f"{format_memory(attention)} for an eager attention matrix), "
               f"{headroom_fraction:.0%} of the card where that is more")
+    if unified:
+        pool = torch.cuda.mem_get_info(devices[0])[1] if devices else 0
+        print(f"  the GPU memory is the system memory, {format_memory(system_available)} "
+              f"of {format_memory(pool)} available, so the budgets above are one "
+              f"pool divided by {UNIFIED_LOAD_PEAK:g}: a load needs that much of "
+              "it per byte of weights, for the host-side copy each tensor is read "
+              "through")
+        # The budget is whatever is free *now*, so a second run of the same
+        # script halves it. Saying how much is elsewhere turns that from a
+        # mystery into an obvious cause.
+        elsewhere = pool - system_available
+        if elsewhere > pool // 10:
+            print(f"  {format_memory(elsewhere)} of it is held by something else "
+                  "right now; another process loading a model is the usual "
+                  "reason, and waiting for it is the usual fix")
+        if host_resident:
+            print(f"  {format_memory(host_resident)} of the weights are budgeted "
+                  "to stay on the host, which is what makes them fit: a byte "
+                  f"costs the pool {UNIFIED_LOAD_PEAK:g} on a device against "
+                  f"{UNIFIED_HOST_COPY:g} left where it was read. They are still "
+                  "in the same memory, so the cost is a RAM-to-RAM copy per "
+                  "forward pass rather than anything being read from disk")
     if weights:
+        placeable = sum(max_memory.values())
         print(f"  weights to place: {format_memory(weights)}, "
               + (f"more than the {format_memory(sum(v for k, v in max_memory.items() if k != 'cpu'))} "
                  f"of VRAM budget, so {format_memory(onload)} per GPU is also "
                  "reserved to onload an offloaded block"
                  if offloading and onload else "which the GPUs have room for"))
+        if weights > placeable:
+            print(f"  WARNING: {format_memory(weights)} of weights against "
+                  f"{format_memory(placeable)} of budget. This load will fail, "
+                  "and on a unified-memory machine it fails by being killed by "
+                  "the kernel partway through rather than by raising"
+                  if unified else
+                  f"  WARNING: {format_memory(weights)} of weights against "
+                  f"{format_memory(placeable)} of budget; set OFFLOAD_DIR")
+            print("  Options: build fewer layers (max_layers / TRUNCATE_LAYERS / "
+                  "SWEEP_UNTIL), set OFFLOAD_DIR to spill to disk, use a "
+                  "quantized checkpoint, or override the estimate with "
+                  "MAX_MEMORY / GPU_HEADROOM if you know better")
     if weight_growth != 1.0:
         print(f"  budgets divided by {weight_growth:g}: the weights grow by that "
               "much when compressed-tensors decompresses them on the first "
@@ -939,6 +1223,78 @@ def pin_tiny_offloaded_modules(model, limit="1MiB"):
     return pinned, pinned_bytes
 
 
+def promote_offloaded_modules(model, keep_free="4GiB"):
+    """Move offloaded weights onto their execution device, now that there is room.
+
+    The budget that got the model loaded had to leave room for the copies the
+    load reads every tensor through, and on a unified-memory machine those copies
+    are most of what a load costs (see `UNIFIED_LOAD_PEAK`): a 56GiB checkpoint
+    only fits at all if a slice of it is left on the host. But those copies are
+    gone by the time this runs -- process RSS fell from a 34.6GiB peak to 878MiB
+    when the load returned -- so the memory that paid for them is free again, and
+    the blocks that were parked on the host to make the load possible no longer
+    have any reason to stay there.
+
+    The difference is not small. A host-resident block is copied to its execution
+    device inside its own forward pre-hook, which during generation means once
+    per token: measured on this model with 18GiB left on the host, 740ms per
+    token.
+
+    Does nothing when there is no room, which is the case on an ordinary discrete
+    GPU whose VRAM the budget already filled. Returns (module count, bytes).
+    """
+    from accelerate.hooks import AlignDevicesHook
+    from accelerate.utils import set_module_tensor_to_device
+    from accelerate.utils.modeling import named_module_tensors
+
+    keep_free = parse_memory(keep_free)
+    room = {}
+    promoted = 0
+    promoted_bytes = 0
+    for module in model.modules():
+        hook = getattr(module, "_hf_hook", None)
+        if not isinstance(hook, AlignDevicesHook) or not hook.offload:
+            continue
+        device = hook.execution_device
+        if device is None or hook.weights_map is None:
+            continue
+        index = getattr(device, "index", device)
+        if not isinstance(index, int):
+            continue            # not a CUDA device; nothing to promote onto
+
+        if index not in room:
+            room[index] = max(0, torch.cuda.mem_get_info(index)[0] - keep_free)
+
+        tensors = list(named_module_tensors(
+            module, include_buffers=hook.offload_buffers,
+            recurse=hook.place_submodules, remove_non_persistent=True))
+        size = sum(tensor.numel() * tensor.element_size() for _, tensor in tensors)
+        if not size or size > room[index]:
+            continue
+
+        for name, _ in tensors:
+            set_module_tensor_to_device(module, name, device,
+                                        value=hook.weights_map[name])
+        # Keep the hook: it is still what moves this module's inputs to the right
+        # device. It just has nothing left to onload or to evict.
+        hook.offload = False
+        room[index] -= size
+        promoted += 1
+        promoted_bytes += size
+
+        # The host copy is what `weights_map` reads from, and it is dead weight
+        # now. Dropping it is best-effort on purpose: the structure behind
+        # `weights_map` is accelerate's business, and holding the copy wastes
+        # memory where failing to promote would waste a second per token.
+        dataset = getattr(hook.weights_map, "dataset", None)
+        prefix = getattr(hook.weights_map, "prefix", "")
+        if isinstance(dataset, dict):
+            for name, _ in tensors:
+                dataset.pop(prefix + name, None)
+
+    return promoted, promoted_bytes
+
+
 def get_input_device(model):
     """Where the input ids have to be put.
 
@@ -1017,7 +1373,9 @@ def load_model(model_id, dtype="auto", device_map="auto", max_memory=None,
                offload_dir=None, quantization_config=None, workload_tokens=1024,
                gpu_headroom=None, gpu_headroom_fraction=0.05, cpu_limit=None,
                keep_packed=True, pin_limit="1MiB", fix_targets=True,
-               max_layers=None, workload_sequence=None, trust_remote_code=True):
+               fix_shapes=True, max_layers=None, workload_sequence=None,
+               trust_remote_code=True, promote_offloaded=True,
+               promote_keep_free="4GiB"):
     """Load `model_id` spread over the GPUs, RAM and `offload_dir`.
 
     `workload_tokens` is the batch size times the sequence length of the biggest
@@ -1029,6 +1387,13 @@ def load_model(model_id, dtype="auto", device_map="auto", max_memory=None,
     `max_layers` builds only that many decoder layers. Worth setting whenever the
     activation being read comes from the middle of the model, since the layers
     after it are never executed.
+
+    `fix_shapes` reconciles the config's MoE expert width with the shapes in the
+    checkpoint before anything is built from it; see `repair_expert_width`.
+
+    `promote_offloaded` moves offloaded blocks onto the GPU once the load has
+    finished and given its own working set back, keeping `promote_keep_free` per
+    device in hand; see `promote_offloaded_modules`.
     """
     config = AutoConfig.from_pretrained(model_id, trust_remote_code=trust_remote_code)
 
@@ -1036,6 +1401,15 @@ def load_model(model_id, dtype="auto", device_map="auto", max_memory=None,
     if dropped:
         print(f"Building only the first {max_layers} of {max_layers + dropped} "
               f"decoder layers; the other {dropped} are never executed")
+
+    # Headers only, so this is instant even on a 1.5TB checkpoint, and it is read
+    # once: both the expert-width repair and the memory budget below need it.
+    shapes = checkpoint_tensor_shapes(model_id)
+
+    # A config that describes a different model than the weights do has to be
+    # corrected before `from_pretrained` builds anything from it, and the
+    # corrected config has to be handed over explicitly.
+    rewidened = fix_shapes and repair_expert_width(config, shapes)
 
     # An over-broad `targets` regex stops the checkpoint from loading at all, so
     # this has to happen before `from_pretrained` and the repaired config has to
@@ -1061,7 +1435,7 @@ def load_model(model_id, dtype="auto", device_map="auto", max_memory=None,
         load_kwargs["quantization_config"] = quantization_config
     if offload_dir is not None:
         load_kwargs["offload_folder"] = offload_dir
-    if repaired or dropped:
+    if repaired or dropped or rewidened:
         # Only when the config was actually changed: passing `config` makes
         # transformers skip its own config load, and there is no reason to take
         # that path when the checkpoint's own config is fine.
@@ -1071,11 +1445,9 @@ def load_model(model_id, dtype="auto", device_map="auto", max_memory=None,
         "auto", "balanced", "balanced_low_0", "sequential")
     resident = 0
     if max_memory is None and sharded and torch.cuda.device_count() > 0:
-        # Headers only, so this is instant even on a 1.5TB checkpoint. It says
-        # how much has to be placed and how big the largest indivisible block is,
-        # which is what decides whether an onload buffer has to be reserved.
-        resident, onload = checkpoint_footprint(
-            checkpoint_tensor_sizes(model_id), max_layers)
+        # How much has to be placed, and how big the largest indivisible block
+        # is, which is what decides whether an onload buffer has to be reserved.
+        resident, onload = checkpoint_footprint(tensor_sizes(shapes), max_layers)
         max_memory = build_max_memory(config, workload_tokens,
                                       headroom=gpu_headroom,
                                       headroom_fraction=gpu_headroom_fraction,
@@ -1083,6 +1455,25 @@ def load_model(model_id, dtype="auto", device_map="auto", max_memory=None,
                                       weight_growth=weight_growth,
                                       sequence=workload_sequence,
                                       weights=resident, onload=onload)
+        # On a unified-memory machine an over-committed load does not raise, it
+        # gets the process killed by the kernel -- there is no MemoryError to
+        # catch and nothing to report afterwards, only a dead process some
+        # minutes in. Refusing up front is the only form this failure can take
+        # that says what happened, and every way around it is a knob the caller
+        # already has.
+        if (resident > sum(max_memory.values()) and offload_dir is None
+                and unified_memory()):
+            raise RuntimeError(
+                f"{format_memory(resident)} of weights do not fit the "
+                f"{format_memory(sum(max_memory.values()))} this machine can "
+                "spare, and its GPU memory is its system memory, so starting "
+                "the load anyway ends in the kernel killing the process partway "
+                "through rather than in an error. The budget is what is free at "
+                "this moment, so check first whether something else is holding "
+                "the memory; otherwise build fewer layers (max_layers), set "
+                "offload_dir to spill to disk, use a quantized checkpoint, or "
+                "pass max_memory/gpu_headroom explicitly if this estimate is "
+                "wrong.")
     if max_memory is not None:
         load_kwargs["max_memory"] = max_memory
 
@@ -1152,6 +1543,18 @@ def load_model(model_id, dtype="auto", device_map="auto", max_memory=None,
             print(f"Pinned {pinned} small offloaded modules "
                   f"({format_memory(pinned_bytes)}) to their execution device "
                   f"in {format_duration(time.perf_counter() - started)}")
+
+    # After the load, not before: the room this uses is the room the load needed
+    # for its own copies, and it only exists once the load has returned.
+    if promote_offloaded:
+        started = time.perf_counter()
+        moved, moved_bytes = promote_offloaded_modules(model, promote_keep_free)
+        if moved:
+            print(f"Promoted {moved} offloaded module(s) "
+                  f"({format_memory(moved_bytes)}) onto their execution device "
+                  f"in {format_duration(time.perf_counter() - started)}: the "
+                  "load's own working set is no longer holding that memory, and "
+                  "a module left behind is copied there on every forward pass")
     print("Model ready.")
 
     return model

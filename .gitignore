@@ -3,3 +3,5 @@
 *.model
 *.safetensors
 __pycache__/
+kl_cache/
+refusal_cache/

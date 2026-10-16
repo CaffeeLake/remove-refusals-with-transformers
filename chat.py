@@ -23,7 +23,7 @@ from transformers import AutoTokenizer, TextStreamer
 
 from model_loading import get_input_device, load_model
 
-MODEL_ID = "../Kimi-K3-Abliterated"
+MODEL_ID = "../Hy-Memory-30B-A3B-Abliterated"
 
 # "auto" follows the checkpoint. Forcing float16 on a bfloat16 model throws away
 # most of its exponent range.

@@ -47,8 +47,8 @@ from transformers import AutoConfig
 from model_loading import (format_duration, format_memory,
                            ignore_dense_targets, leaf_pattern,
                            module_paths, narrow_targets, select_modules)
-MODEL_ID = "../Kimi-K3"
-OUTPUT_DIR = "../Kimi-K3-Abliterated"
+MODEL_ID = "../Hy-Memory-30B-A3B"
+OUTPUT_DIR = "../Hy-Memory-30B-A3B-Abliterated"
 
 REFUSAL_DIR_PATH = MODEL_ID.replace("/", "_") + "_refusal_dir.pt"
 
