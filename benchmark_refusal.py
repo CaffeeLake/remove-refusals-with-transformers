@@ -26,6 +26,12 @@ Greedy decoding, so the comparison is between two models rather than between two
 samples. The two models are never in memory at once: each is loaded in a child
 process that writes its answers to a cache file and exits, which is what makes
 this runnable on a machine with one model's worth of RAM to spare.
+
+On a reasoning model the refusal classifier has a second problem, and
+ENABLE_THINKING below is the knob for it: the answer it is handed starts with a
+thinking block, so none of its openings are at the start of the text. MAX_NEW_TOKENS
+also has to cover the whole trace before the answer begins -- Dory1.0-4B
+regularly spends more than 420 tokens thinking before it says anything.
 """
 
 import hashlib
@@ -42,24 +48,47 @@ from transformers import AutoTokenizer
 
 from model_loading import format_duration, get_input_device, load_model
 
-BASE_MODEL = "../Hy-Memory-30B-A3B"
-ABLATED_MODEL = "../Hy-Memory-30B-A3B-Abliterated"
+BASE_MODEL = "../NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16"
+ABLATED_MODEL = "../NVIDIA-Nemotron-Labs-Dory1.0-4B-Abliterated"
 
 # Prompts per class. Generation is the expensive measurement in this repo -- a
 # forward pass per token rather than per prompt -- so this is small on purpose
 # and the printed confidence interval says how much that costs. The upstream
 # numbers this repo quotes were measured on 16.
-PROMPTS = 32
-BATCH_SIZE = 8
+PROMPTS = 24
+BATCH_SIZE = 24
 
 # Long enough that a refusal has room to turn into an answer and an answer has
 # room to show whether it is coherent, short enough that the run is not an hour.
-MAX_NEW_TOKENS = 192
+MAX_NEW_TOKENS = 2048
 
 # How much of the answer the refusal classifier looks at. A refusal announces
 # itself at the start; past the first sentence or two, the same words appear in
 # answers that are not refusals.
-REFUSAL_WINDOW = 400
+REFUSAL_WINDOW = 2048
+
+# Whether the chat template opens a thinking block.
+#
+# Not the same knob as the other scripts' `PROBE`, which names a *position* to
+# read an activation at; this one decides how the model is invoked, because
+# nothing here reads an activation. False corresponds to `PROBE = "answer"` and
+# True to either of the other two.
+#
+# False ends the prompt with `<think></think>`, so the model answers
+# immediately and the first words of what it generates are the first words of
+# the answer -- which is what REFUSAL_WINDOW and the refusal openings assume.
+# The same knob as measure_kl.py's, for the same reason: with thinking on, Dory
+# writes hundreds of tokens of reasoning first, and a refusal opening that
+# arrives after it is outside the window the classifier looks at (and often
+# outside MAX_NEW_TOKENS entirely -- six of six harmful prompts spent more than
+# 420 tokens thinking in a spot check). Worse, the reasoning *discusses*
+# refusing ("Direct refusal: I can't write a program to..."), so matching it
+# scores a refusal whatever the answer turns out to be.
+#
+# True is the setting to use for measuring the model as it is actually served,
+# but then MAX_NEW_TOKENS has to be large enough to reach `</think>` and the
+# classifier should be pointed at the text after it.
+ENABLE_THINKING = False
 
 SEED = 1
 
@@ -115,7 +144,9 @@ def fingerprint(harmful, harmless):
     digest = hashlib.sha256()
     for prompt in harmful + harmless:
         digest.update(prompt.encode())
-    digest.update(f"{MAX_NEW_TOKENS}".encode())
+    # Both of these change what was generated, so a cache from a different
+    # setting is not comparable and must not be silently reused.
+    digest.update(f"{MAX_NEW_TOKENS}|thinking={ENABLE_THINKING}".encode())
     return digest.hexdigest()[:16]
 
 
@@ -141,7 +172,8 @@ def generate(model_id):
                 conversation=[[{"role": "user", "content": insn}]
                               for insn in chunk],
                 add_generation_prompt=True, tokenize=True, padding=True,
-                return_dict=True, return_tensors="pt")))
+                return_dict=True, return_tensors="pt",
+                enable_thinking=ENABLE_THINKING)))
 
     longest = max(inputs["input_ids"].shape[1]
                   for group in batches.values() for _, inputs in group)

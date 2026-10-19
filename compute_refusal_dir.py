@@ -6,12 +6,14 @@ from transformers import AutoConfig, AutoTokenizer, BitsAndBytesConfig
 
 from tqdm import tqdm
 
-from model_loading import (format_duration, get_decoder_layers,
-                           get_input_device, layer_count, load_model)
+import probes
+from model_loading import (execution_schedule, format_duration,
+                           get_decoder_layers, get_input_device, layer_count,
+                           load_model)
 
 torch.inference_mode()
 
-MODEL_ID = "../Hy-Memory-30B-A3B"
+MODEL_ID = "../NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16"
 # MODEL_ID = "tiiuae/Falcon3-1B-Instruct"
 # MODEL_ID = "Qwen/Qwen3-1.7B"
 # MODEL_ID = "stabilityai/stablelm-2-zephyr-1_6b"
@@ -64,11 +66,15 @@ CPU_LIMIT = None
 KEEP_PACKED = True
 
 # How deep into the model the refusal direction is read from. 0.6 is the constant
-# the upstream repo inherited; this is the measured one. choose_layer.py puts the
-# optimum on Hy-Memory-30B-A3B at 0.71 (layer 34 of 48) and keeps putting it
-# there: 0.69, 0.71, 0.71 and 0.73 over four independent counts of excluded
-# dimensions in one run, and 0.69, 0.71, 0.73 over three runs at three prompt
-# counts. Against layer 28, which is what 0.6 selects:
+# the upstream repo inherited; this is the measured one, and it is measured per
+# model -- 0.71 on Hy-Memory-30B-A3B, 0.76 on Dory1.0-4B. On a looped model it is
+# a fraction of the *forward pass* rather than of the layer list; see the comment
+# on `schedule` further down.
+#
+# For Hy-Memory-30B-A3B choose_layer.py put the optimum at 0.71 (layer 34 of 48)
+# and kept putting it there: 0.69, 0.71, 0.71 and 0.73 over four independent
+# counts of excluded dimensions in one run, and 0.69, 0.71, 0.73 over three runs
+# at three prompt counts. Against layer 28, which is what 0.6 selects:
 #
 #     layer 28 (0.6 ): effect size 7.02, explains 35.2% of the difference at
 #                      every layer
@@ -80,7 +86,31 @@ KEEP_PACKED = True
 # for it except that it was already written down. 0.80 is where generation starts
 # to degrade on the models that were checked against it, so 0.71 is not near the
 # other edge.
-LAYER_FRACTION = 0.71
+#
+# 0.76 is the same measurement on Dory1.0-4B: position 85 of the 112 its forward
+# pass has, which is decoder layer 45 on the second of its two passes through the
+# recurrent block. Effect size 10.33 held out, agreement 1.00, explaining 99.9%
+# of the difference at its own position and 35.5% across all of them, with
+# ENABLE_THINKING off -- the numbers are about a point lower and five points
+# worse respectively with it on, and that direction does not work; see its
+# comment below.
+#
+# Two things about that are worth knowing before trusting it. The plateau is wide
+# -- 36 of the 100 positions swept are inside it, spread over both passes -- and
+# the runner-up is position 45, which is *the same layer on its first pass*: 9.97
+# and 35.3% against 10.33 and 35.5%. So what the criterion is really choosing is
+# layer 45, and which pass contributes almost nothing; the deeper of the two is
+# taken because position 45 is fraction 0.40, exactly where this script's own
+# "unusually shallow" warning starts and where a direction removed no refusals on
+# every model that was checked against generation.
+#
+# The other is that the re-injection is visible in the sweep and should not be
+# mistaken for the usable range ending: the effect size falls from 9.07 at
+# position 55, the end of the first pass, to 3.65 at position 56, because the
+# input block's output is mixed back into the residual stream at the start of
+# every loop. It climbs back past 10 by position 85. A looped model has that dip
+# once per loop and it means nothing about where the refusal direction lives.
+LAYER_FRACTION = 0.77
 
 # Build only the layers up to the one the activation is read from. Everything
 # after it is never executed -- the capture hook aborts the forward pass -- so
@@ -124,6 +154,17 @@ random.seed(1)
 # models that do not have the problem: 0.938 -> 0.937 on Qwen3-14B's own layer
 # 19, 0.886 -> 0.889 on Qwen3-8B, 0.850 -> 0.850 on Qwen3.5-9B. Raising it past 2
 # changes nothing either (flat from 2 to 128); 0 turns it off.
+#
+# On Dory1.0-4B this knob cannot do what it exists for, and the value is a tie
+# rather than a finding. It is an nGPT model: every sublayer ends by projecting
+# the residual stream back onto the unit sphere, so no dimension can be three
+# orders of magnitude above the rest and the massive-activation failure is
+# structurally impossible. At the chosen position the four counts score 10.31,
+# 10.33, 10.33 and 10.35, agreement is 1.00 for all of them, and the direction's
+# largest component is 11% of its norm either way (2.0% would be isotropic).
+# choose_layer.py reports 1 because 0's own best position scored 0.2% under the
+# 2% band -- which is noise, not a reason -- so anything from 0 to 3 is equally
+# defensible here.
 DROP_LARGEST_DIMENSIONS = 1
 
 # Share of the prompts kept out of the direction and used only to check it. The
@@ -131,10 +172,45 @@ DROP_LARGEST_DIMENSIONS = 1
 # number, and it costs nothing because the activations are collected either way.
 # Set it to 0 to skip the check.
 HELDOUT_FRACTION = 0.1
+
+# Where along the sequence the activation is read from. LAYER_FRACTION is the
+# depth; this is the other coordinate, and on a reasoning model it decides
+# whether any of this works at all. probes.py documents all three and the
+# measurements that rank them; in one line each:
+#
+# choose_layer.py's PROBE has to match this one, or it picks a layer for a
+# direction other than the one built here. measure_kl.py's does *not*: that one
+# says where the result is evaluated, which is a separate question with its own
+# right answer ("answer").
+#
+#   "thinking"  the last prompt token with `<think>\n` open. The traditional
+#               method, and the only position a model without a thinking mode
+#               has. On Dory1.0-4B it reads a *topic* direction and ablating it
+#               changes no behaviour whatsoever.
+#   "answer"    `<think></think>`, so the next token begins the answer. Works.
+#   "close"     the `</think>` at the end of the model's own reasoning trace.
+#               Works best, and needs a generation pass per prompt first.
+#
+# On Dory1.0-4B, ablating with each and reading the first answer token:
+#
+#   probe      KL harmful  KL harmless   ratio  harmful top-1 kept  harmless
+#   thinking        0.106        0.058    1.8x               95.3%     89.1%
+#   answer          2.663        0.163   16.4x                8.3%     89.6%
+#   close           3.032        0.124   24.4x                2.1%     95.8%
+PROBE = "close"
+
+# Only used by `PROBE = "close"`. The budget is per trace; a prompt whose
+# reasoning has not reached `</think>` by then is dropped, and the counts are
+# printed. `MEDIUM_EFFORT` asks the model for shorter reasoning (Dory's
+# "{reasoning effort: efficient}"), which roughly halves the wall clock without
+# measurably moving the direction -- see `reasoning_traces`.
+TRACE_BUDGET = 2048
+MEDIUM_EFFORT = True
+TRACE_BATCH_SIZE = 24
 # Prompts per forward pass. On a model too big to fit in VRAM the weights have
 # to be streamed from RAM/disk for every forward, so a larger batch directly
 # divides the wall clock time. Lower it if activations blow up the VRAM.
-batch_size = 64
+batch_size = 24
 pos = -1
 
 print("Instruction count: " + str(instructions))
@@ -155,25 +231,44 @@ harmless_instructions = random.sample(harmless, instructions)
 tokenizer.padding_side = "left"
 
 
-def tokenize(batch):
-    return tokenizer.apply_chat_template(
-        conversation=[[{"role": "user", "content": insn}] for insn in batch],
-        add_generation_prompt=True,
-        tokenize=True,
-        padding=True,
-        return_dict=True,
-        return_tensors="pt")
+# The "close" probe needs the model's own reasoning before it has a position to
+# read, so that generation happens here -- before the truncated model below is
+# built, since generation needs every layer. It is cached and resumable.
+traces = {"harmful": None, "harmless": None}
+if PROBE == "close":
+    traces = probes.reasoning_traces(
+        MODEL_ID, tokenizer,
+        {"harmful": harmful_instructions, "harmless": harmless_instructions},
+        budget=TRACE_BUDGET, medium_effort=MEDIUM_EFFORT,
+        batch_size=TRACE_BATCH_SIZE, dtype=DTYPE, device_map=DEVICE_MAP,
+        max_memory=MAX_MEMORY, offload_dir=OFFLOAD_DIR,
+        gpu_headroom=GPU_HEADROOM, gpu_headroom_fraction=GPU_HEADROOM_FRACTION,
+        cpu_limit=CPU_LIMIT, keep_packed=KEEP_PACKED)
+
+# One id sequence per prompt, ending at the token the activation is read from.
+# `kept` differs from the prompt list only for "close", where a prompt whose
+# reasoning never closed has nowhere to read from; the two classes can then end
+# up with different counts, which everything below is written to allow.
+sequences, kept = {}, {}
+for label, group in (("harmful", harmful_instructions),
+                     ("harmless", harmless_instructions)):
+    sequences[label], kept[label] = probes.probe_sequences(
+        tokenizer, group, PROBE, traces[label], MEDIUM_EFFORT)
+    if len(kept[label]) < len(group):
+        print(f"  {len(group) - len(kept[label])} {label} prompt(s) dropped: "
+              f"no `</think>` within {TRACE_BUDGET} tokens")
 
 
-def batches(instructions):
-    return [instructions[start:start + batch_size]
-            for start in range(0, len(instructions), batch_size)]
+def batches(label):
+    return [probes.pad_left(sequences[label][start:start + batch_size],
+                            tokenizer.pad_token_id)
+            for start in range(0, len(sequences[label]), batch_size)]
 
 
 # Tokenize before the model is loaded: the size of the biggest forward pass is
 # what the VRAM reserve has to cover, and measuring it beats guessing it.
-harmful_batches = [tokenize(batch) for batch in batches(harmful_instructions)]
-harmless_batches = [tokenize(batch) for batch in batches(harmless_instructions)]
+harmful_batches = batches("harmful")
+harmless_batches = batches("harmless")
 shapes = [tuple(inputs["input_ids"].shape)
           for inputs in harmful_batches + harmless_batches]
 workload_tokens = max(rows * columns for rows, columns in shapes)
@@ -202,13 +297,34 @@ if LOAD_IN_4BIT:
 
 # The layer index has to come from the config, not from the loaded model: with
 # TRUNCATE_LAYERS the model no longer has the layers this fraction refers to.
-total_layers = layer_count(config)
+#
+# And the fraction is a fraction of the *forward pass*, not of the layer list.
+# The two differ on a looped model, where a layer in the shared recurrent block
+# is executed once per loop and each pass through it is a different point in the
+# computation: Dory's 72 layers run 112 times at two loops. choose_layer.py
+# sweeps and reports those 112 positions, so LAYER_FRACTION is resolved the same
+# way here -- a position first, then the layer it belongs to and which of its
+# passes that is.
+schedule = execution_schedule(config)
+total_layers = len(schedule)
 if not total_layers:
     raise RuntimeError(f"cannot tell how many decoder layers {MODEL_ID} has")
-layer_idx = int(total_layers * LAYER_FRACTION)
-print(f"Layer index: {layer_idx} of {total_layers}")
+# Clamped, because LAYER_FRACTION = 1.0 names a position one past the end: the
+# last layer's *output* is not something a forward pre-hook can see.
+position = min(total_layers - 1, int(total_layers * LAYER_FRACTION))
+layer_idx = schedule[position]
+passes = [step for step, index in enumerate(schedule) if index == layer_idx]
+capture_pass = passes.index(position)
+if total_layers == layer_count(config):
+    print(f"Layer index: {layer_idx} of {total_layers}")
+else:
+    print(f"Position {position} of {total_layers}: decoder layer {layer_idx} "
+          f"of {layer_count(config)}, on pass {capture_pass + 1} of "
+          f"{len(passes)} through it")
 if TRUNCATE_LAYERS:
-    load_kwargs["max_layers"] = layer_idx + 1
+    # Not `layer_idx + 1`: the deepest layer that has to have run by then,
+    # which on the second traversal of a recurrent block is the whole block.
+    load_kwargs["max_layers"] = max(schedule[:position + 1]) + 1
 
 model = load_model(MODEL_ID,
                    dtype=DTYPE,
@@ -234,7 +350,7 @@ if layer_idx >= len(layers):
     raise RuntimeError(
         f"the model built {len(layers)} decoder layers but the activation is "
         f"read from layer {layer_idx}; the config's layer count "
-        f"({total_layers}) does not describe this architecture")
+        f"({layer_count(config)}) does not describe this architecture")
 
 # On a model whose weights have to be unpacked (or streamed) for every forward
 # pass, a batch takes minutes, so the bar is the only thing that says whether the
@@ -249,6 +365,10 @@ bar = tqdm(total=instructions * 2, unit="prompt", smoothing=0.1,
 # grab the activation straight off the layer with a forward pre-hook. The input
 # of layer N is exactly `hidden_states[N]` in the usual HF convention.
 captured = []
+# How many times the hooked layer has run in the current forward pass. Always 0
+# on an ordinary stack; on a looped one it is what tells the first traversal of
+# the recurrent block from the second, and only `capture_pass` is wanted.
+calls = []
 
 
 class StopForward(Exception):
@@ -256,6 +376,9 @@ class StopForward(Exception):
 
 
 def capture_hook(module, args, kwargs):
+    calls.append(None)
+    if len(calls) - 1 != capture_pass:
+        return
     hidden_states = kwargs.get("hidden_states")
     if hidden_states is None:
         hidden_states = args[0]
@@ -274,6 +397,7 @@ def collect_hidden(label, tokenized_batches):
         bar.set_description(f"{label} {index}/{len(tokenized_batches)}")
         started = time.perf_counter()
         captured.clear()
+        calls.clear()
         try:
             with torch.no_grad():
                 model(input_ids=inputs["input_ids"].to(input_device),
@@ -346,9 +470,9 @@ if drop is not None:
     # option exists for; one that holds almost none of it was excluded for
     # nothing, which is the normal case and costs nothing either.
     raw = harmful_hidden.mean(dim=0) - harmless_hidden.mean(dim=0)
-    count = len(harmful_hidden)
-    error = torch.sqrt(harmful_hidden.var(dim=0) / count
-                       + harmless_hidden.var(dim=0) / count).clamp_min(1e-9)
+    error = torch.sqrt(harmful_hidden.var(dim=0) / len(harmful_hidden)
+                       + harmless_hidden.var(dim=0) / len(harmless_hidden)
+                       ).clamp_min(1e-9)
     magnitude = torch.cat([harmful_hidden, harmless_hidden]).abs().mean(dim=0)
     print(f"Dropped {len(drop)} dimension(s) with the largest activations from "
           "the difference:")
@@ -364,17 +488,30 @@ if drop is not None:
               "distinguishable from noise: without this option the direction "
               "would have been that dimension rather than the refusal.")
 
-held_out = int(len(harmful_hidden) * HELDOUT_FRACTION)
+# Per class, because the two can hold different numbers of rows: the "close"
+# probe drops a prompt whose reasoning never reached `</think>`, and the two
+# classes do not reason for the same length of time.
+def split(rows):
+    held = int(len(rows) * HELDOUT_FRACTION)
+    return slice(0, len(rows) - held), slice(len(rows) - held, None)
+
+
+harmful_fit, harmful_check = split(harmful_hidden)
+harmless_fit, harmless_check = split(harmless_hidden)
+held_out = min(len(harmful_hidden[harmful_check]),
+               len(harmless_hidden[harmless_check]))
 if held_out >= 2:
-    fit = slice(0, len(harmful_hidden) - held_out)
-    check = slice(len(harmful_hidden) - held_out, None)
-    probe = direction_between(harmful_hidden[fit], harmless_hidden[fit], drop)
-    raw_fit, size_fit = separation_along(probe, harmful_hidden[fit], harmless_hidden[fit])
-    raw_out, size_out = separation_along(probe, harmful_hidden[check], harmless_hidden[check])
-    print(f"Separation, from {len(harmful_hidden) - held_out} prompts per class:")
+    probe = direction_between(harmful_hidden[harmful_fit],
+                              harmless_hidden[harmless_fit], drop)
+    raw_fit, size_fit = separation_along(probe, harmful_hidden[harmful_fit],
+                                         harmless_hidden[harmless_fit])
+    raw_out, size_out = separation_along(probe, harmful_hidden[harmful_check],
+                                         harmless_hidden[harmless_check])
+    print(f"Separation, from {len(harmful_hidden[harmful_fit])} harmful and "
+          f"{len(harmless_hidden[harmless_fit])} harmless prompts:")
     print(f"  on the prompts it was built from : {raw_fit:9.4f}  "
           f"(effect size {size_fit:6.2f})")
-    print(f"  on {held_out} held-out prompts per class  : {raw_out:9.4f}  "
+    print(f"  on the held-out prompts          : {raw_out:9.4f}  "
           f"(effect size {size_out:6.2f})")
     if size_out < 0.5:
         print("  WARNING: the direction does not generalise. It is noise, and "

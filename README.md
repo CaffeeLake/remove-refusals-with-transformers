@@ -125,6 +125,64 @@ Both ends use it. compute_refusal_dir.py and inference.py repair the config in m
 ### trust_remote_code models and the transformers version
 Models that ship their own modeling code are written against one transformers release and usually only assert a lower bound. Kimi K3, for example, imports `OutputRecorder` from `transformers.utils.generic`, which moved to `transformers.utils.output_capturing` in transformers 5.x, so it needs `transformers==4.56.*`. save_ablated_model.py is unaffected either way: it only reads the config and the safetensors shards, never the modeling code.
 
+### Models transformers does not have at all
+`trust_remote_code` only helps when the checkpoint ships code to trust. `NVIDIA-Nemotron-Labs-Dory1.0-4B` ships none — its support lives in a vLLM PR and a llama.cpp PR — so `AutoConfig` cannot name `model_type: dory`, falls back to the base config class, and rejects the checkpoint's own `layer_types` before the tokenizer is even built. modeling_dory.py is that architecture written out for transformers and registered with the `Auto*` classes; model_loading.py imports it, so every script here gets it. It is checked against a vLLM server's prompt logprobs, and the file says how.
+
+### Reasoning models: which *position* the direction is read from
+LAYER_FRACTION says how deep into the model to read the residual stream. The other coordinate — which token of the sequence to read it at — was never a choice worth making, because `add_generation_prompt=True` put it at the token before the answer. On a reasoning model it does not: Dory's template ends the prompt with `<|im_start|>assistant\n<think>\n`, so the activation comes from the token before the *reasoning* starts.
+
+`PROBE` in probes.py selects between three positions. choose_layer.py and compute_refusal_dir.py have to agree on it, or the layer is chosen for a different direction than the one built. **measure_kl.py's `PROBE` is a different question and should stay at `"answer"`**: it names the position the result is *evaluated* at, not the one the direction was read from, and the two are independent. benchmark_refusal.py has `ENABLE_THINKING` instead, because it reads no activation — it decides how the model is invoked.
+
+Evaluating at `"close"` is the one way to look at a working ablation and conclude it failed. The checkpoint built from the 1024-prompt `"close"` direction reads a 0.3x ratio with harmful top-1 100% unchanged at that position, and 46.3x with harmful top-1 7.8% unchanged at `"answer"` — same checkpoint, same prompts. See the section on refusal that is already text for why.
+
+| `PROBE` | position | needs generation |
+|---|---|---|
+| `"thinking"` | the last prompt token, `<think>\n` open — the traditional method, and the only position a model without a thinking mode has | no |
+| `"answer"` | `<think></think>`, so the next token begins the answer | no |
+| `"close"` | the `</think>` ending the model's *own* reasoning trace | yes, one trace per prompt |
+
+Measuring at the thinking position produces a direction that looks good and does nothing. Dory's own next-token distribution there is `'The'` at p = 0.9998 for all 64 harmful and 62 of 64 harmless prompts, an entropy of 0.0015 nats — the model has decided nothing yet. A difference-of-means direction read there still separates the classes (effect size 9.0), because the *topic* is in the residual stream, but it is a topic direction. Ablated with it, every mechanical check passes and the behaviour does not move. Ablating all 73 residual writers with each probe's direction and reading the first answer token, 48 held-out prompts per class:
+
+| | thinking | answer | close |
+|---|---|---|---|
+| KL harmful | 0.106 | 2.663 | **3.032** |
+| KL harmless | 0.058 | 0.163 | **0.124** |
+| harmful/harmless KL ratio | 1.8x | 16.4x | **24.4x** |
+| harmful first token unchanged | 95.3% | 8.3% | **2.1%** |
+| harmless first token unchanged | 89.1% | 89.6% | **95.8%** |
+
+`"close"` wins every column — it moves the harmful distribution more *and* leaves the harmless one alone more — and it is the only one that stops the model refusing the hardest of six spot-checked prompts. The directions are related but distinct: cosine(thinking, answer) = 0.41, cosine(answer, close) = 0.68. At the chosen position the thinking probe scores an effect size of 9.01 and explains 28.7% of the difference everywhere, against 10.33 and 35.5% for the answer probe.
+
+At full scale the ranking holds. 1024 prompts per class and a 1024-token trace budget (1011 of 1024 harmful traces closed and 629 of 1024 harmless) give a direction with a held-out effect size of 10.64, and the checkpoint built from it measures a **46.3x** ratio at `"answer"` against the 31.2x of the 1024-prompt `"answer"` direction. Its harmful opening tokens go from `'I'` x35 / `'申し訳'` x18 / `'私は'` x9 to `'Here'` x15 / `'To'` x13 / `'**'` x6, with harmless top-1 preserved on 82.8% of prompts and the harmless prompt log-probability at +0.043 nats per token.
+
+Three things are worth knowing before using `"close"`:
+
+* It costs a greedy generation per prompt. On Dory1.0-4B that is ~2.8s per prompt (batch 48, 512-token budget, `medium_effort`), so 1024 prompts per class is a couple of hours against about a minute for the other two. `reasoning_traces` caches to `trace_cache/` and is resumable per batch.
+* Not every prompt produces a position: 184 of 240 harmful traces reached `</think>` inside 512 tokens but only 61 of 240 harmless, because the alpaca-style harmless tasks deliberate far longer. The two classes therefore end up with different row counts, which the per-class statistics allow for. The selection is not what the direction encodes — length-matching the two classes before taking the difference of means moves it by cosine 0.9991 and its effect size by 0.01.
+* `{reasoning effort: efficient}` (the template's `medium_effort`, on by default for this probe) roughly halves the wall clock, 2m14s against 5m23s per batch of 48.
+
+None of the three is a cure. With `enable_thinking=False` five of six spot-checked harmful prompts stop being refused and engage with the topic instead; with thinking on, the model reasons its way back to a softer refusal ("私はこれを支持できません") on most of them. The next section is why.
+
+### What a weight ablation cannot do: refusal that is already text
+Teacher-forced on the base model's own reasoning traces and measured at `</think>`, every direction and every span tried leaves the harmful first-answer-token top-1 **100%** unchanged, with a KL of 0.002 to 0.022. By that point the trace says "I should refuse" in so many words, and the model is reading its own writing: no edit to the residual stream can remove text that is already in the context.
+
+This is the thinking-mode refusal that survives an otherwise successful ablation, and it is a different mechanism from the one the technique addresses. Removing it would mean intervening on the reasoning as it is generated, not on the weights.
+
+### Removing more than one direction is worse
+Tried twice, with {thinking, answer} and with {answer, close}, projecting out an orthonormal basis of the span instead of a single direction. Both times the harmful KL was unchanged (3.005 → 3.004 and 3.032 → 3.957 with most of that gain on harmless prompts too) while the harmless KL rose — 0.170 → 0.196 and 0.124 → 0.430 — and harmless top-1 agreement fell to 87.5% and 75.0% respectively. With `{thinking, answer}` the generated text was byte-identical to the answer-only ablation on the prompts checked.
+
+Each extra direction costs one of `hidden_size` dimensions in all 73 matrices whether or not it buys anything, and the second direction here buys nothing: the part of the thinking direction orthogonal to the answer direction is the topic feature, which the model does not use to decide whether to refuse.
+
+Two further notes on nGPT, which Dory is the first of here. Neither explains the above, but both are real:
+
+* **The residual update is not an addition.** Dory's is `justnorm((1 - a) * justnorm(h) + a * justnorm(out))` with a learned **per-channel** `a` — a diagonal matrix, which does not map the orthogonal complement of `r` into itself. Feeding two vectors that are *exactly* orthogonal to `r` through the real layers puts a component back: 4.6e-03 relative at layer 0, 6.3e-03 at layer 1, 9.6e-04 at layer 45. So `(I - r rᵀ)W` on every writer cannot drive the residual stream's `r`-component to zero the way it does in an additive-residual model; it reaches 0.17x that of an isotropic vector, which is below chance and evidently enough.
+* **Amplitude is not information.** Every sublayer renormalizes the residual stream onto the unit sphere and every learned scale is multiplicative, so what the next layer sees is an angle. The *effect size* along `r` therefore survives better than the gap does — 4.47 against the base's 9.34, at 1/30 the amplitude — and `max |h|` is ~1 everywhere, which is why choose_layer.py's massive-activation warning cannot mean anything on this architecture and DROP_LARGEST_DIMENSIONS has nothing to do.
+
+### Looped models
+Dory applies one shared block of layers several times (`n_recurrent_loops`), re-injecting the input block's output at the start of every pass, so its 72 layers execute 112 times at the default of two loops. A layer index then does not identify a point in the computation: the second traversal of layer 45 reads a residual stream the first traversal produced, and it is a *different* place to take a refusal direction from, reached through the same weights. `execution_schedule` in model_loading.py is the translation, and `LAYER_FRACTION` is a fraction of the 112 positions rather than of the 72 layers — choose_layer.py sweeps and reports them that way and compute_refusal_dir.py resolves them that way, so the number still copies straight across. On the 4B checkpoint it picks position 85, which is layer 45 on its second pass, where the held-out effect size is 9.0 and split-half agreement 1.00.
+
+The two passes do not measure the same: the first traversal peaks around an effect size of 11 and the second settles near 9, and "explains everywhere" — the criterion that chooses inside the plateau — is highest in the second. `TRUNCATE_LAYERS` still works, but it cannot simply keep the first *n* layers: the layers it drops have to be ones that never run before the capture, which past the first loop means the whole recurrent block has to be built. Both scripts ask `max(schedule[:position + 1]) + 1` for that.
+
 ## Credits
 - [Harmful instructions](https://github.com/llm-attacks/llm-attacks/blob/main/data/advbench/harmful_behaviors.csv)
 - [Harmless instructions](https://huggingface.co/datasets/yahma/alpaca-cleaned)

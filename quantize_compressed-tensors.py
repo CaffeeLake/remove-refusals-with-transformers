@@ -1,11 +1,24 @@
-"""Pack a checkpoint's routed experts into compressed-tensors MXFP4.
+"""Quantize a checkpoint into a compressed-tensors format.
 
-This streams the safetensors shards one at a time, replaces every routed-expert
-projection with the `weight_packed` / `weight_scale` pair of the
-`mxfp4-pack-quantized` format, and writes a `quantization_config` that describes
-the result. The model is never instantiated, so peak memory is one shard rather
-than the whole checkpoint -- the same property that makes save_ablated_model.py
-usable on checkpoints larger than RAM.
+This streams the safetensors shards one at a time, replaces every selected
+projection with the tensors its format stores (`weight_packed` / `weight_scale`
+for the packed formats, `weight` / `weight_scale` for MXFP8), and writes a
+`quantization_config` that describes the result. The model is never
+instantiated, so peak memory is one shard rather than the whole checkpoint --
+the same property that makes save_ablated_model.py usable on checkpoints larger
+than RAM.
+
+`SELECTION` decides which modules are quantized, because the two architectures
+this has been used on want opposite things:
+
+* `"routed_experts"` -- a MoE checkpoint (Kimi K3, Hy-Memory-30B-A3B), where the
+  experts are nearly all the parameters and everything else writes to the
+  residual stream or decides which expert runs. The notes below are about this
+  case.
+* `"all_projections"` -- a dense checkpoint, where leaving the attention and MLP
+  projections in bf16 would quantize nothing at all. This is what NVIDIA's own
+  Dory1.0-4B MXFP8 and NVFP4 builds do, and `KEEP_WRITERS_DENSE` is the one
+  place this departs from them; see its comment.
 
 The scheme follows moonshotai/Kimi-K3: MXFP4 weights (E2M1 elements, one E8M0
 power-of-two scale per 32 values along the input axis), `targets: ["Linear"]`,
@@ -62,7 +75,21 @@ own floor rather than anything about the scale policy: compressed-tensors picks
 two for 96% of the groups here and within 0.03 points of a per-group search
 overall. A model whose weights were edited by less than that -- an ablated
 residual writer, say -- must not be packed, which is why save_ablated_model.py
-dequantizes those instead; see its WRITER_PRECISION notes.
+dequantizes those instead; see its WRITER_PRECISION notes and
+`KEEP_WRITERS_DENSE` below.
+
+On matching NVIDIA's own Dory builds. Their MXFP8 is compressed-tensors
+`mxfp8-quantized`, which is what this writes: decoding their checkpoint with the
+compressor used here reproduces their bf16 weights to 2.66%, i.e. the formats
+are the same down to the bytes. Their NVFP4 is *not* compressed-tensors but
+modelopt (`quant_algo: W4A16_NVFP4`, plus an `hf_quant_config.json`), and the
+difference is in the names and one convention rather than in the arithmetic:
+`weight` holds what compressed-tensors calls `weight_packed`, `weight_scale_2`
+holds the per-tensor scale as the *reciprocal* of `weight_global_scale`, and
+with those two substitutions their checkpoint decodes at 8.15%, the expected
+NVFP4 floor. This writes the compressed-tensors spelling because transformers
+has no modelopt loader at all, so a modelopt-layout checkpoint could be served
+by vLLM but could not be loaded -- or KL-measured -- by anything in this repo.
 """
 
 import json
@@ -82,17 +109,62 @@ from model_loading import (expert_width, format_duration, format_memory,
                            ignore_dense_targets, matches, module_paths,
                            narrow_targets, select_modules, tensor_sizes)
 
-MODEL_ID = "../Hy-Memory-30B-A3B-Abliterated"
-OUTPUT_DIR = "../Hy-Memory-30B-A3B-Abliterated-MXFP4"
+MODEL_ID = "../NVIDIA-Nemotron-Labs-Dory1.0-4B-Abliterated"
+OUTPUT_DIR = "../NVIDIA-Nemotron-Labs-Dory1.0-4B-Abliterated-MXFP8"
 
-# Format the routed experts are packed into. All three are compressed-tensors
-# formats that a `quantization_config` can name; MXFP4 is Kimi-K3's.
+# Format the selected weights are packed into. All three are compressed-tensors
+# formats that a `quantization_config` can name; MXFP4 is Kimi-K3's, and MXFP8
+# and NVFP4 are the two NVIDIA publishes Dory1.0-4B in.
 #
 #   format   bits/weight   round-trip error
 #   mxfp4        4.25           11.2%
-#   nvfp4        4.5             9.5%
+#   nvfp4        4.5             8.2%
 #   mxfp8        8.25            2.7%
-WEIGHT_PRECISION = "mxfp4"
+WEIGHT_PRECISION = "mxfp8"
+
+# Which modules get quantized.
+#
+#   "routed_experts"   a MoE checkpoint's routed experts and nothing else. The
+#                      experts are 94% of Kimi-K3's parameters, and everything
+#                      left dense either writes to the residual stream or picks
+#                      which expert runs.
+#   "all_projections"  every attention and MLP projection, i.e. what NVIDIA's
+#                      Dory builds quantize. A dense architecture has no experts
+#                      to select, so the other setting would quantize nothing.
+#
+# Either way the embeddings and `lm_head` stay dense, which is also what both
+# official Dory builds do (`ignore: ["backbone.embeddings", "lm_head"]`).
+SELECTION = "all_projections"
+
+# Leave the residual writers dense, and on the `ignore` list, rather than
+# quantizing them with everything else.
+#
+# This is the one deliberate difference from NVIDIA's own builds, and it only
+# matters for an *ablated* checkpoint. The ablation `W <- (I - r r^T)W` is a
+# relative edit of about `1/sqrt(hidden_size)`, which is 1.98% at Dory's 2560,
+# and a format's round-trip error lands isotropically -- so whatever that error
+# is, that much of the refusal direction comes back. Measured on the
+# Dory1.0-4B abliterated writers, as the share of an un-ablated matrix's
+# component that is left (save_ablated_model.py's `relative`, where 1.0 is a
+# matrix that was never touched):
+#
+#     dense/bf16   6.4e-03    the floor: bf16 rounding of the dense edit
+#     MXFP8        2.8e-02    4x the floor, under this repo's 5% warning
+#     NVFP4        9.7e-02    ~10% of the direction restored
+#
+# The cost is that the writers are 31% of the projection parameters, so the
+# output is larger than the official build: 5.4GiB against 4.4GiB for MXFP8 and
+# 4.4GiB against 3.0GiB for NVFP4. Set this to False to match the official
+# layout exactly and accept the leak; the residual report at the end measures
+# whichever choice was made, and measure_kl.py says whether it changed the
+# model's behaviour.
+KEEP_WRITERS_DENSE = False
+
+# Last name component of the projections whose output is added to the residual
+# stream -- the same list save_ablated_model.py ablates. Only consulted when
+# KEEP_WRITERS_DENSE is set.
+WRITER_SUFFIXES = ("o_proj", "out_proj", "down_proj", "wo", "c_proj", "dense",
+                   "dense_4h_to_h", "routed_expert_up_proj")
 
 # Activation scheme written into the config. None is Kimi-K3's own setting and
 # means the activations stay in the model's compute dtype. "mxfp8" / "mxfp4" ask
@@ -133,6 +205,19 @@ ROUTED_EXPERT = re.compile(
     r"(?:^|\.)experts(?:\.\d+)?\."
     r"(?:gate_up_proj|gate_proj|up_proj|down_proj|w1|w2|w3)$")
 
+# Every projection inside a decoder layer, whatever the architecture calls the
+# block that holds them (`mixer` on Dory, `self_attn`/`mlp` elsewhere). Anchored
+# on the layer index so that nothing outside the stack -- the embeddings, the
+# head, a vision tower -- can be selected by accident.
+LAYER_PROJECTION = re.compile(
+    r"(?:^|\.)(?:layers|h|blocks|block)\.\d+\..*"
+    r"(?:q_proj|k_proj|v_proj|g_proj|o_proj|out_proj|qkv_proj|gate_proj"
+    r"|up_proj|gate_up_proj|down_proj|dense|dense_4h_to_h|c_proj|wo"
+    r"|w1|w2|w3)$")
+
+SELECTIONS = {"routed_experts": ROUTED_EXPERT,
+              "all_projections": LAYER_PROJECTION}
+
 # Module names that exist only after the architecture's load-time renaming, so
 # they cannot be derived from the checkpoint. `ignore` is matched against the
 # built model, so a config that lists only the checkpoint's spelling lets
@@ -141,10 +226,16 @@ ROUTED_EXPERT = re.compile(
 #   checkpoint                  transformers (modeling_hy_v3.py)
 #   mlp.shared_mlp.*_proj   ->  mlp.shared_experts.*_proj
 #   mlp.router.gate         ->  mlp.gate
-TRANSFORMERS_ALIASES = (
+#
+# Specific to the MoE architectures `SELECTION = "routed_experts"` is for: a
+# dense checkpoint is built under the names it ships with, so adding these would
+# only put patterns in `ignore` that match nothing.
+MOE_TRANSFORMERS_ALIASES = (
     r"re:(?:.*\.)?shared_experts\.(?:gate|up|down|gate_up)_proj$",
     r"re:(?:.*\.)?mlp\.gate$",
 )
+TRANSFORMERS_ALIASES = (MOE_TRANSFORMERS_ALIASES
+                        if SELECTION == "routed_experts" else ())
 
 # Quantization arguments per format. The MX formats are E8M0 power-of-two block
 # scales (`scale_dtype=uint8`) over 32 values with the element type following
@@ -338,18 +429,27 @@ input_activations = activation_args(ACTIVATION_PRECISION)
 group_size = weight_args["group_size"]
 
 # --- plan -------------------------------------------------------------------
-# Which tensors get packed, and why the rest do not. A routed-expert projection
+# Which tensors get packed, and why the rest do not. A selected projection
 # whose input axis is not a multiple of the group size cannot be packed at all,
 # and silently leaving it dense would contradict the config, so it is an error.
 
+if SELECTION not in SELECTIONS:
+    raise ValueError(f"unknown SELECTION {SELECTION!r}; use one of "
+                     + ", ".join(sorted(SELECTIONS)))
+selected = SELECTIONS[SELECTION]
+
 to_pack = []
+held_back = []
 for name, shape in sorted(shapes.items()):
     module, _, leaf = name.rpartition(".")
-    if leaf != "weight" or not ROUTED_EXPERT.search(module):
+    if leaf != "weight" or not selected.search(module):
         continue
     if len(shape) not in (2, 3):
         raise RuntimeError(f"{name} has shape {shape}; expected a 2D projection "
                            "or a 3D stack of them")
+    if KEEP_WRITERS_DENSE and module.rpartition(".")[2] in WRITER_SUFFIXES:
+        held_back.append(name)
+        continue
     if shape[-1] % group_size:
         raise RuntimeError(
             f"{name} has {shape[-1]} input features, which is not a multiple of "
@@ -359,8 +459,9 @@ for name, shape in sorted(shapes.items()):
 
 if not to_pack:
     raise RuntimeError(
-        "Found no routed-expert projections. This architecture names its "
-        "experts differently; extend ROUTED_EXPERT.")
+        f"SELECTION = {SELECTION!r} matched nothing in this checkpoint. Its "
+        f"modules are named differently; extend {SELECTION.upper()} or "
+        "SELECTIONS.")
 
 packed_modules = {name.rpartition(".")[0] for name in to_pack}
 # Everything else that owns a real weight has to be on the `ignore` list, or
@@ -395,6 +496,14 @@ for name in to_pack:
     counts[name.split(".")[-2]] = counts.get(name.split(".")[-2], 0) + 1
 for leaf, count in sorted(counts.items()):
     print(f"  {count:5d} x *.{leaf}")
+if held_back:
+    kept = {}
+    for name in held_back:
+        kept[name.split(".")[-2]] = kept.get(name.split(".")[-2], 0) + 1
+    print("  held back as residual writers, left dense (KEEP_WRITERS_DENSE): "
+          + ", ".join(f"{count} x *.{leaf}" for leaf, count in sorted(kept.items()))
+          + f" -- {sum(element_count(shapes[name]) for name in held_back) / 1e9:.2f}B "
+            "parameters that would otherwise be quantized")
 print(f"{len(to_pack)} of {len(shapes)} tensors will be packed as "
       f"{target_format}: {packed_params / 1e9:.2f}B of {all_params / 1e9:.2f}B "
       f"parameters ({packed_params / all_params:.1%}), "
@@ -602,9 +711,21 @@ print(f"  on disk            {format_memory(written_bytes)} "
       f"(was {format_memory(dense_total)}, "
       f"{dense_total / written_bytes:.2f}x smaller)")
 print(f"  resident, packed   {format_memory(written_bytes)}  "
-      "(vLLM/SGLang, with a fused-MoE MXFP4 kernel)")
-print(f"  resident, unpacked {format_memory(dense_total)}  "
-      "(transformers: the experts are merged into one dense nn.Parameter per "
-      "layer, so they cannot stay packed)")
+      f"(a runtime with a {WEIGHT_PRECISION} kernel: vLLM, SGLang)")
+if SELECTION == "routed_experts":
+    print(f"  resident, unpacked {format_memory(dense_total)}  "
+          "(transformers: the experts are merged into one dense nn.Parameter "
+          "per layer, so they cannot stay packed)")
+elif target_format.endswith("pack-quantized"):
+    print(f"  resident, unpacked {format_memory(dense_total)}  "
+          "(transformers without model_loading.py's KEEP_PACKED, which "
+          "compressed-tensors would otherwise decompress on the first forward)")
+else:
+    # MXFP8 keeps a real `weight` of a dtype no matmul accepts, so
+    # compressed-tensors has to decompress it eagerly whatever the caller wants;
+    # `weights_stay_packed` in model_loading.py is what knows this.
+    print(f"  resident, unpacked {format_memory(dense_total)}  "
+          f"(transformers: {target_format} is not a packed format, so it is "
+          "decompressed on load whatever KEEP_PACKED says)")
 print("Load it like any other model:")
 print(f'    AutoModelForCausalLM.from_pretrained("{OUTPUT_DIR}")')

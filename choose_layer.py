@@ -48,10 +48,21 @@ DROP_LARGEST_DIMENSIONS is the answer to that, and it is swept here too: it take
 a list, and every value in it is measured from the same captured activations,
 because how many dimensions to exclude changes only the arithmetic that turns
 those activations into a direction. Reloading the model to try another value buys
-nothing. The value is reported with the layer, since the two interact -- excluding
-the largest dimensions is what makes the deeper layers of a massive-activation
-model usable at all -- and it is judged on split-half agreement rather than on
-effect size, for the reason given on `agreement`.
+nothing. The value is reported with the layer, since the two interact --
+excluding the largest dimensions is what makes the deeper layers of a massive-
+activation model usable at all -- and it is judged on split-half agreement rather
+than on effect size, for the reason given on `agreement`.
+
+What is swept is positions in the forward pass, which on most models is the same
+thing as decoder layers but on a looped one is not. Dory applies a shared
+40-layer recurrent block `n_recurrent_loops` times, so its 72 layers run 112
+times at the default of two loops, and the second traversal of layer 30 reads a
+residual stream that the first traversal produced -- a different point in the
+computation, with its own refusal signal, reached through the same weights. The
+sweep therefore runs over `execution_schedule(config)`: 112 rows rather than 72,
+and the fraction reported at the end is a fraction of the depth the model
+actually has. compute_refusal_dir.py resolves LAYER_FRACTION the same way, so
+the number can be copied across unchanged.
 """
 
 import random
@@ -61,10 +72,12 @@ import time
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
-from model_loading import (format_duration, get_decoder_layers, get_input_device,
-                           layer_count, load_model)
+import probes
+from model_loading import (execution_schedule, format_duration,
+                           get_decoder_layers, get_input_device, layer_count,
+                           load_model)
 
-MODEL_ID = "../Hy-Memory-30B-A3B"
+MODEL_ID = "../NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16"
 
 DTYPE = "auto"
 DEVICE_MAP = "auto"
@@ -96,7 +109,7 @@ SWEEP_UNTIL = 0.9
 # aborted at the deepest swept layer and cost about three seconds per batch, so
 # the extra prompts are the cheapest part of this script.
 instructions = 1024
-batch_size = 64
+batch_size = 24
 
 # Unseeded, the output of this script is a different constant every time it runs,
 # and the constant gets hardcoded into compute_refusal_dir.py: it has to be
@@ -121,6 +134,26 @@ HELDOUT_FRACTION = 0.375
 # try another one is pure waste. The sweep then reports which value to set in
 # compute_refusal_dir.py alongside which layer.
 DROP_LARGEST_DIMENSIONS = [0, 1, 2, 3]
+
+# Which position along the sequence every row of this sweep is measured at:
+# "thinking" (the traditional method), "answer" or "close". probes.py documents
+# the three and what each is worth.
+#
+# It has to match compute_refusal_dir.py's, or this picks a layer for a
+# direction that is not the one built there. measure_kl.py's PROBE is a
+# different question -- where to *evaluate* -- and should stay at "answer"
+# whatever is set here.
+#
+# It moves the numbers as well as the direction: at the answer position the
+# chosen position scores an effect size of 10.33 and explains 35.5% of the
+# difference everywhere, against 9.01 and 28.7% at the thinking position.
+PROBE = "close"
+
+# Only used by `PROBE = "close"`; the same settings as compute_refusal_dir.py's,
+# and they have to agree for the trace cache to be shared rather than rebuilt.
+TRACE_BUDGET = 2048
+MEDIUM_EFFORT = True
+TRACE_BATCH_SIZE = 24
 
 # An effect size below this is noise. Measured against generation: every layer
 # scoring under about 4 removed no refusals and every layer over it removed most
@@ -163,20 +196,42 @@ harmful_instructions = random.sample(harmful, instructions)
 harmless_instructions = random.sample(harmless, instructions)
 
 
-def tokenize(batch):
-    return tokenizer.apply_chat_template(
-        conversation=[[{"role": "user", "content": insn}] for insn in batch],
-        add_generation_prompt=True, tokenize=True, padding=True,
-        return_dict=True, return_tensors="pt")
+# The "close" probe needs the model's own reasoning before there is a position
+# to read, so that generation happens here, before the truncated model below is
+# built. Cached and resumable; see `reasoning_traces`.
+traces = {"harmful": None, "harmless": None}
+if PROBE == "close":
+    traces = probes.reasoning_traces(
+        MODEL_ID, tokenizer,
+        {"harmful": harmful_instructions, "harmless": harmless_instructions},
+        budget=TRACE_BUDGET, medium_effort=MEDIUM_EFFORT,
+        batch_size=TRACE_BATCH_SIZE, dtype=DTYPE, device_map=DEVICE_MAP,
+        max_memory=MAX_MEMORY, offload_dir=OFFLOAD_DIR,
+        gpu_headroom=GPU_HEADROOM, gpu_headroom_fraction=GPU_HEADROOM_FRACTION,
+        cpu_limit=CPU_LIMIT, keep_packed=KEEP_PACKED)
+
+# How many rows each class ends up with. Equal to `instructions` for every
+# probe but "close", which drops a prompt whose reasoning never reached
+# `</think>` -- and the two classes do not reason for the same length of time,
+# so the counts differ. Everything below is written per class because of it.
+sequences, counts = {}, {}
+for label, group in (("harmful", harmful_instructions),
+                     ("harmless", harmless_instructions)):
+    sequences[label], kept = probes.probe_sequences(
+        tokenizer, group, PROBE, traces[label], MEDIUM_EFFORT)
+    counts[label] = len(kept)
+    if len(kept) < len(group):
+        print(f"  {len(group) - len(kept)} {label} prompt(s) dropped: no "
+              f"`</think>` within {TRACE_BUDGET} tokens")
 
 
-def batches(prompts):
-    return [tokenize(prompts[start:start + batch_size])
-            for start in range(0, len(prompts), batch_size)]
+def batches(label):
+    return [probes.pad_left(sequences[label][start:start + batch_size],
+                            tokenizer.pad_token_id)
+            for start in range(0, len(sequences[label]), batch_size)]
 
 
-tokenized = {"harmful": batches(harmful_instructions),
-             "harmless": batches(harmless_instructions)}
+tokenized = {"harmful": batches("harmful"), "harmless": batches("harmless")}
 shapes = [tuple(inputs["input_ids"].shape)
           for group in tokenized.values() for inputs in group]
 workload_tokens = max(rows * columns for rows, columns in shapes)
@@ -186,11 +241,34 @@ print(f"Largest forward pass: {workload_tokens} tokens "
       f"{workload_sequence} tokens)")
 
 config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
-total_layers = layer_count(config)
+# Which layer runs at each step of the forward pass. The identity on an
+# ordinary stack; on a looped model the recurrent block appears once per loop,
+# and it is the step -- not the layer -- that identifies a point in the
+# computation. Everything below is indexed by step.
+schedule = execution_schedule(config)
+total_layers = len(schedule)
 if not total_layers:
     raise RuntimeError(f"cannot tell how many decoder layers {MODEL_ID} has")
+# Which step each layer's successive calls correspond to, i.e. the inverse of
+# the schedule: `{30: [30, 70]}` for a layer traversed in both loops.
+steps_of = {}
+for step, index in enumerate(schedule):
+    steps_of.setdefault(index, []).append(step)
+
 deepest = min(total_layers - 1, int(total_layers * SWEEP_UNTIL))
-print(f"Sweeping layers 1..{deepest} of {total_layers}")
+# Every layer that runs at or before the deepest swept step has to be built;
+# the rest never execute. On a looped model that is more than `deepest + 1`
+# layers as soon as the deepest step is in the second loop, because the whole
+# recurrent block had to run to produce it.
+needed = max(schedule[:deepest + 1]) + 1
+if total_layers == layer_count(config):
+    print(f"Sweeping layers 1..{deepest} of {total_layers}")
+else:
+    print(f"Sweeping positions 1..{deepest} of {total_layers}: this is a looped "
+          f"model, whose {layer_count(config)} layers execute {total_layers} "
+          f"times ({max(len(steps) for steps in steps_of.values())} passes "
+          "through its shared recurrent block), so a position in the forward "
+          "pass is what gets swept rather than a layer")
 
 model = load_model(MODEL_ID,
                    dtype=DTYPE,
@@ -203,37 +281,48 @@ model = load_model(MODEL_ID,
                    gpu_headroom_fraction=GPU_HEADROOM_FRACTION,
                    cpu_limit=CPU_LIMIT,
                    keep_packed=KEEP_PACKED,
-                   max_layers=deepest + 1)
+                   max_layers=needed)
 
 input_device = get_input_device(model)
 layers = get_decoder_layers(model)
-if deepest >= len(layers):
+if needed > len(layers):
     raise RuntimeError(
-        f"the model built {len(layers)} decoder layers but the sweep goes to "
-        f"{deepest}; the config's layer count ({total_layers}) does not "
-        "describe this architecture")
+        f"the model built {len(layers)} decoder layers but the sweep needs "
+        f"{needed} of them; the config's layer count ({layer_count(config)}) "
+        "does not describe this architecture")
 
 captured = {}
+# How many times each layer has already run in the current forward pass, which
+# is what says which loop it is in and therefore which step this is.
+calls = {}
 
 
 class StopForward(Exception):
-    """Nothing past the deepest swept layer is read, so nothing past it runs."""
+    """Nothing past the deepest swept step is read, so nothing past it runs."""
 
 
 def capture_hook(index):
+    steps = steps_of[index]
+
     def inner(module, args, kwargs):
+        call = calls.get(index, 0)
+        calls[index] = call + 1
+        if call >= len(steps):
+            return              # more passes than the schedule accounts for
+        step = steps[call]
+        if step > deepest:
+            return
         hidden = kwargs.get("hidden_states")
         if hidden is None:
             hidden = args[0]
-        captured.setdefault(index, []).append(
-            hidden.detach()[:, -1, :].to("cpu", torch.float32))
-        if index == deepest:
+        captured[step] = hidden.detach()[:, -1, :].to("cpu", torch.float32)
+        if step == deepest:
             raise StopForward
     return inner
 
 
 handles = [layer.register_forward_pre_hook(capture_hook(index), with_kwargs=True)
-           for index, layer in enumerate(layers[:deepest + 1])]
+           for index, layer in enumerate(layers[:needed])]
 
 
 def collect(label, group):
@@ -241,6 +330,7 @@ def collect(label, group):
     for number, inputs in enumerate(group, 1):
         print(f"  {label} batch {number}/{len(group)}", flush=True)
         captured.clear()
+        calls.clear()
         started = time.perf_counter()
         try:
             with torch.no_grad():
@@ -249,10 +339,10 @@ def collect(label, group):
                       use_cache=False)
         except StopForward:
             pass
-        for index, chunk in captured.items():
-            rows.setdefault(index, []).append(chunk[0])
+        for step, chunk in captured.items():
+            rows.setdefault(step, []).append(chunk)
         print(f"    {format_duration(time.perf_counter() - started)}", flush=True)
-    return {index: torch.cat(chunks) for index, chunks in rows.items()}
+    return {step: torch.cat(chunks) for step, chunks in rows.items()}
 
 
 started = time.perf_counter()
@@ -261,9 +351,23 @@ for handle in handles:
     handle.remove()
 print(f"Collected the activations in {format_duration(time.perf_counter() - started)}")
 
-held_out = max(2, int(instructions * HELDOUT_FRACTION))
-fit = slice(0, instructions - held_out)
-check = slice(instructions - held_out, None)
+# Per class, and named rather than passed around as a slice, because the two
+# classes can hold different numbers of rows: the "close" probe drops a prompt
+# whose reasoning never reached `</think>`, and the two classes do not reason
+# for the same length of time.
+#
+#   fit     builds every direction
+#   check   never seen by a direction it scores -- every number reported is
+#           out-of-sample
+#   first / second   the two disjoint halves of `fit` that `agreement` compares
+parts = {}
+for label, count in counts.items():
+    held = max(2, int(count * HELDOUT_FRACTION))
+    half = (count - held) // 2
+    parts[label] = {"fit": slice(0, count - held),
+                    "check": slice(count - held, None),
+                    "first": slice(0, half),
+                    "second": slice(half, count - held)}
 swept = sorted(index for index in states["harmful"] if index >= 1)
 
 
@@ -285,9 +389,12 @@ def magnitude_order(index):
 
 
 def difference_at(index, part, drop):
-    """Difference of the class means over `part`, with `drop` dimensions zeroed."""
-    difference = (states["harmful"][index][part].mean(0)
-                  - states["harmless"][index][part].mean(0))
+    """Difference of the class means over `part`, with `drop` dimensions zeroed.
+
+    `part` names one of the splits in `parts`, which holds a slice per class.
+    """
+    difference = (states["harmful"][index][parts["harmful"][part]].mean(0)
+                  - states["harmless"][index][parts["harmless"][part]].mean(0))
     if drop > 0:
         difference = difference.clone()
         difference[magnitude_order(index)[:drop]] = 0
@@ -300,8 +407,8 @@ def direction_at(index, part, drop):
 
 
 def effect_size(direction, index):
-    a = states["harmful"][index][check] @ direction
-    b = states["harmless"][index][check] @ direction
+    a = states["harmful"][index][parts["harmful"]["check"]] @ direction
+    b = states["harmless"][index][parts["harmless"]["check"]] @ direction
     spread = torch.sqrt((a.var() + b.var()) / 2).clamp_min(1e-9)
     return ((a.mean() - b.mean()) / spread).item()
 
@@ -316,9 +423,8 @@ def agreement(index, drop):
     -- on Qwen3-14B's layer 20 it reads 0.19 with nothing excluded and 0.89 with
     the largest two excluded, where the effect size moves far less.
     """
-    half = (instructions - held_out) // 2
-    first = direction_at(index, slice(0, half), drop)
-    second = direction_at(index, slice(half, instructions - held_out), drop)
+    first = direction_at(index, "first", drop)
+    second = direction_at(index, "second", drop)
     return torch.dot(first, second).item()
 
 
@@ -326,10 +432,10 @@ def sweep(drop):
     """One row per layer, for directions with `drop` dimensions excluded."""
     # The held-out difference of every layer, because the "explains everywhere"
     # column needs all of them for each layer it scores.
-    differences = {index: difference_at(index, check, drop) for index in swept}
+    differences = {index: difference_at(index, "check", drop) for index in swept}
     rows = []
     for index in swept:
-        probe = direction_at(index, fit, drop)
+        probe = direction_at(index, "fit", drop)
         here = differences[index]
         explains_here = (torch.dot(here, probe).abs()
                          / here.norm().clamp_min(1e-9)).item()
@@ -386,9 +492,11 @@ def choose(rows):
     return max(plateau, key=lambda row: (row[EVERYWHERE], -row[LAYER]))
 
 
-print(f"\n{instructions - held_out} prompts per class build each direction, "
-      f"{held_out} check it, and the agreement column splits the first "
-      f"{instructions - held_out} in half")
+print("\n" + " and ".join(
+    f"{len(range(*parts[label]['fit'].indices(counts[label])))} {label}"
+    for label in ("harmful", "harmless"))
+    + " prompts build each direction, the rest check it, and the agreement "
+      "column splits the first group in half")
 
 results = {}
 for drop in drop_counts:
@@ -448,6 +556,14 @@ rows = results[drop][0]
 print(f"\nBest layer: {best[LAYER]} of {total_layers} -> "
       f"LAYER_FRACTION = {best[LAYER] / total_layers:.2f}, "
       f"DROP_LARGEST_DIMENSIONS = {drop}")
+if total_layers != layer_count(config):
+    chosen = schedule[best[LAYER]]
+    print(f"  position {best[LAYER]} is decoder layer {chosen} on pass "
+          f"{steps_of[chosen].index(best[LAYER]) + 1} of "
+          f"{len(steps_of[chosen])} through it; the fraction above is of the "
+          f"{total_layers} positions the forward pass has, not of the "
+          f"{layer_count(config)} layers it has, and compute_refusal_dir.py "
+          "reads it that way")
 print(f"  effect size {best[EFFECT]:.2f}, agreement {best[AGREE]:.2f}, explains "
       f"{best[HERE]:.1%} of its own layer's difference and {best[EVERYWHERE]:.1%} "
       "across all of them")

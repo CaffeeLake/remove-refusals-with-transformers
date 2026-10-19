@@ -46,6 +46,19 @@ modules:
    read is left at a default twice the real value. Transformers then builds
    experts of the wrong shape and refuses the load. `repair_expert_width`
    measures the width from the checkpoint's own shapes and corrects the config.
+
+7. An architecture can be missing from the installed transformers altogether,
+   which is not a size problem but fails even earlier -- `AutoConfig` cannot
+   name the model type, so nothing at all gets built. Importing
+   `modeling_dory` (below) registers Dory, whose checkpoint ships no
+   `modeling_*.py` for `trust_remote_code` to pick up; see that file.
+
+One thing here is not about loading at all. A looped architecture executes its
+layers more than once -- Dory runs its shared recurrent block
+`n_recurrent_loops` times -- so "layer 30" does not identify a point in the
+computation and "how deep is this activation" has no answer in terms of modules.
+`execution_schedule` is the translation, and everything in this repo that reads
+an activation out of the middle of a model goes through it.
 """
 
 import faulthandler
@@ -61,6 +74,20 @@ import torch
 import torch.nn as nn
 from transformers import AutoConfig, AutoModelForCausalLM
 
+# Imported for the side effect: it registers architectures the installed
+# transformers does not know about with the `Auto*` classes. Keep it before
+# anything calls `AutoConfig.from_pretrained`.
+#
+# Broadly guarded on purpose. The registration is additive -- every other model
+# this repo is used with loads without it -- so a modeling file that no longer
+# matches the installed transformers should cost one architecture, not every
+# script in the repo.
+try:
+    import modeling_dory  # noqa: F401
+except Exception as error:                                      # noqa: BLE001
+    print(f"Could not register the architectures in modeling_dory.py ({error!r}); "
+          "a checkpoint that needs one of them will fail to load")
+
 __all__ = [
     "load_model",
     "get_decoder_layers",
@@ -71,6 +98,7 @@ __all__ = [
     "pin_tiny_offloaded_modules",
     "promote_offloaded_modules",
     "layer_count",
+    "execution_schedule",
     "truncate_layers",
     "kv_cache_bytes",
     "activation_bytes",
@@ -251,6 +279,49 @@ def layer_count(config):
     return 0
 
 
+# How a looped architecture advertises its layout: an input block, a shared
+# recurrent block applied `loops` times with the input block's output
+# re-injected each time, then an output block. Dory is the one this repo has
+# been used with; the names are its config's.
+_LOOP_KEYS = ("n_input_layers", "n_recurrent_layers", "n_output_layers",
+              "n_recurrent_loops")
+
+
+def _loop_layout(config):
+    """(input, recurrent, output, loops), or None for an ordinary stack."""
+    text_config = _text_config(config)
+    layout = [getattr(text_config, key, None) for key in _LOOP_KEYS]
+    if any(value is None for value in layout):
+        return None
+    first, recurrent, last, loops = (int(value) for value in layout)
+    if loops < 2 or recurrent < 1:
+        return None             # a single pass is an ordinary stack
+    if first + recurrent + last != layer_count(config):
+        return None             # the layout does not describe this config
+    return first, recurrent, last, loops
+
+
+def execution_schedule(config):
+    """Which decoder layer runs at each step of one forward pass.
+
+    `[0, 1, ..., n-1]` for an ordinary stack, where the two are the same thing.
+    For a looped model they are not: Dory's 72 layers execute 112 times at its
+    default of two loops, because its 40-layer recurrent block is traversed
+    twice, and the second traversal reads a residual stream that the first one
+    produced. A physical layer is therefore *two* points in the computation, and
+    the depth of an activation -- which is the only thing a refusal direction is
+    indexed by -- is a position in this list, not a layer number.
+    """
+    total = layer_count(config)
+    layout = _loop_layout(config)
+    if layout is None:
+        return list(range(total))
+    first, recurrent, _, loops = layout
+    last = first + recurrent
+    return (list(range(first)) + list(range(first, last)) * loops
+            + list(range(last, total)))
+
+
 def truncate_layers(config, keep):
     """Build only the first `keep` decoder layers.
 
@@ -261,11 +332,20 @@ def truncate_layers(config, keep):
     offloading. Dropping them changes nothing about the captured activation: a
     layer cannot influence its own input.
 
+    On a looped model the caller has to have worked out `keep` from
+    `execution_schedule` rather than from a layer index, because a layer in the
+    recurrent block runs again after the whole block has run: keeping the first
+    `keep` layers is only sound if every layer the capture needs is among them,
+    which `max(schedule[:step + 1]) + 1` is how to ask for. The loop layout is
+    corrected to match, so that what gets built is a shorter looped model rather
+    than a config that contradicts itself and fails validation.
+
     Returns the number of layers that were dropped.
     """
     total = layer_count(config)
     if not total or keep >= total or keep < 1:
         return 0
+    layout = _loop_layout(config)
     # Both the text config and the top level, since which one the model reads
     # depends on the architecture and setting the unused one is harmless.
     for candidate in {id(_text_config(config)): _text_config(config),
@@ -283,6 +363,20 @@ def truncate_layers(config, keep):
             if key.endswith("layer_types") and isinstance(value, list) \
                     and len(value) == total:
                 setattr(candidate, key, value[:keep])
+        if layout is None or not any(getattr(candidate, key, None) is not None
+                                     for key in _LOOP_KEYS):
+            continue
+        # The three blocks have to go on summing to the layer count. Truncation
+        # eats the output block first, then the tail of the recurrent block;
+        # cutting into the recurrent block leaves the loop in place, which is
+        # correct precisely because the capture aborts the forward pass inside
+        # the first traversal of it.
+        first, recurrent, _, _ = layout
+        kept_input = min(first, keep)
+        kept_recurrent = min(recurrent, max(0, keep - kept_input))
+        candidate.n_input_layers = kept_input
+        candidate.n_recurrent_layers = kept_recurrent
+        candidate.n_output_layers = keep - kept_input - kept_recurrent
     return total - keep
 
 
@@ -292,8 +386,11 @@ def kv_cache_bytes(config, tokens):
     An over-estimate on purpose: too much headroom only means a few more layers
     are offloaded, too little means the run dies after the weights are loaded.
     """
+    # One cache entry per *execution*, not per layer: a looped model keeps the
+    # keys of every traversal of its recurrent block separately, since each one
+    # attends over a different residual stream.
+    layers = len(execution_schedule(config))
     config = _text_config(config)
-    layers = getattr(config, "num_hidden_layers", 0) or 0
     heads = getattr(config, "num_attention_heads", 0) or 0
     hidden = getattr(config, "hidden_size", 0) or 0
     head_dim = getattr(config, "head_dim", None) or (hidden // heads if heads else 0)

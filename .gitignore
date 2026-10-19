@@ -5,3 +5,4 @@
 __pycache__/
 kl_cache/
 refusal_cache/
+trace_cache/

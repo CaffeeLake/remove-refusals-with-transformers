@@ -25,6 +25,19 @@ them is the whole point. The absolute KL means little on its own -- it scales
 with how sharp the model's distributions are -- but 100x more divergence on
 harmful than on harmless prompts means the edit went where it was aimed.
 
+Which position counts as "the next token" is not a detail on a reasoning model,
+and getting it wrong makes this whole script read 0.0x on an ablation that
+worked. `add_generation_prompt` on Dory1.0-4B ends the prompt with
+`<|im_start|>assistant\n<think>\n`, so the next token is the first token of the
+*thinking*, not of the answer -- and a reasoning model does not refuse there. It
+measured `'The'` for 64 of 64 harmful prompts at p = 0.9998 and an entropy of
+0.0015 nats: a delta function, with no room for any edit to move probability
+mass and nothing about refusal in it either way. The refusal is decided inside
+the thinking block and emitted after `</think>`, hundreds of tokens later.
+PROBE below is what moves the probe to where the answer starts; it takes the
+same three values as compute_refusal_dir.py's, and probes.py documents them.
+
+
 The two models are never in memory at the same time: each is loaded in a child
 process that writes its distributions to a cache file and exits, which is also
 what makes the loads survivable on a machine where one copy of this model is
@@ -37,23 +50,69 @@ import random
 import subprocess
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import torch
 from transformers import AutoTokenizer
 
-from model_loading import format_duration, format_memory, get_input_device, load_model
+import probes
+from model_loading import (format_duration, format_memory,
+                           get_input_device, load_model)
 
-BASE_MODEL = "../Hy-Memory-30B-A3B"
-ABLATED_MODEL = "../Hy-Memory-30B-A3B-Abliterated"
+BASE_MODEL = "../NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16"
+ABLATED_MODEL = "../NVIDIA-Nemotron-Labs-Dory1.0-4B-Abliterated"
+
+# Either pair can be overridden on the command line, which is what comparing
+# several builds against the same baseline needs:
+#   python measure_kl.py ../Model-Abliterated ../Model-Abliterated-MXFP8
+if len(sys.argv) == 3 and sys.argv[1] != "--capture":
+    BASE_MODEL, ABLATED_MODEL = sys.argv[1], sys.argv[2]
+
+# Which token the KL is measured on. The same three values as
+# compute_refusal_dir.py's `PROBE` and the same machinery in probes.py, but
+# **this is a different choice and must not be copied from there.** There it
+# names the position a direction is *read from*; here it names the position the
+# edit is *evaluated at*, and the two are independent -- a direction read at
+# `</think>` is still judged by what the model says when it answers.
+#
+# Leave this at "answer" unless there is a specific reason not to.
+#
+#   "answer"    the first token of the answer. The only setting that can see a
+#               refusal being removed, whatever probe built the direction.
+#   "thinking"  the first token of the *thinking*, where Dory1.0-4B says `'The'`
+#               with probability 0.9998 whatever it was asked (entropy 0.0015
+#               nats). The harmful column then reads ~0 for any edit, however
+#               large, because there is no probability mass free to move; a
+#               working ablation measured 1.8x this way and a broken one 0.0x.
+#   "close"     the first token after the model's own `</think>`. A different and
+#               far narrower question -- "given *this* reasoning, would it still
+#               refuse?" -- whose answer on Dory1.0-4B is always "yes,
+#               identically": every direction and every span tried leaves the
+#               harmful top-1 at 100.0% with a KL under 0.03, because by then
+#               the refusal is text in the context and no edit to the residual
+#               stream removes text the model has already written.
+#
+#               Measuring here and concluding the ablation failed is the mistake
+#               this comment exists to prevent. The checkpoint built from the
+#               1024-prompt "close" direction reads 0.3x at this position and
+#               46.3x at "answer", on the same 64 prompts.
+#
+# The traces for "close" always come from BASE_MODEL, so that both models are
+# asked about the same reasoning and the comparison is controlled. That also
+# changes what the prompt-log-probability column means; see `compare`.
+PROBE = "answer"
+TRACE_BUDGET = 2048
+MEDIUM_EFFORT = True
+TRACE_BATCH_SIZE = 24
 
 # Prompts per class. The KL per prompt is a per-prompt number rather than an
 # average over a fitted direction, so this does not need the 1024 that
 # compute_refusal_dir.py does; the spread across prompts is reported and says
 # whether more would help. Each one costs a forward pass and 472KiB of cache
 # (one float32 per vocabulary entry).
-PROMPTS = 128
-BATCH_SIZE = 8
+PROMPTS = 1024
+BATCH_SIZE = 24
 
 # Must match whatever the other scripts use, so that the prompts the direction
 # was built from and the prompts it is measured on are drawn the same way.
@@ -82,10 +141,16 @@ def prompts():
 
 
 def fingerprint(harmful, harmless):
-    """Identifies the prompt set, so a stale cache cannot be compared by mistake."""
+    """Identifies the measurement, so a stale cache cannot be compared by mistake.
+
+    The probe position is part of it: two caches taken at different positions
+    are not comparable at all, and the difference between them does not look
+    like an error.
+    """
     digest = hashlib.sha256()
     for prompt in harmful + harmless:
         digest.update(prompt.encode())
+    digest.update(f"probe={PROBE}|{TRACE_BUDGET}|{MEDIUM_EFFORT}".encode())
     return digest.hexdigest()[:16]
 
 
@@ -93,11 +158,20 @@ def cache_path(model_id):
     return CACHE_DIR / (model_id.strip("/").replace("/", "_") + "_kl.pt")
 
 
-def tokenize(tokenizer, batch):
-    return tokenizer.apply_chat_template(
-        conversation=[[{"role": "user", "content": insn}] for insn in batch],
-        add_generation_prompt=True, tokenize=True, padding=True,
-        return_dict=True, return_tensors="pt")
+def weights_stamp(model_id):
+    """Identifies the weights behind `model_id`, cheaply.
+
+    Without this, rebuilding a checkpoint in place -- which is what re-running
+    save_ablated_model.py does -- leaves a cache that still matches on the
+    prompt set and is silently compared against the new model's. The failure
+    looks like an ablation that changed nothing, which is exactly the thing
+    this script is used to rule out.
+    """
+    directory = Path(model_id)
+    if not directory.is_dir():
+        return model_id         # a Hub id is immutable enough for this
+    return sorted((path.name, path.stat().st_size, int(path.stat().st_mtime))
+                  for path in directory.glob("*.safetensors"))
 
 
 def capture(model_id):
@@ -113,9 +187,34 @@ def capture(model_id):
     tokenizer.padding_side = "left"
 
     groups = {"harmful": harmful, "harmless": harmless}
-    batches = {label: [tokenize(tokenizer, group[start:start + BATCH_SIZE])
+    # The traces come from BASE_MODEL whichever model is being captured, so that
+    # both are asked about the same reasoning and the difference is the model
+    # rather than the context. The cache makes the second capture free.
+    traces = {label: None for label in groups}
+    if PROBE == "close":
+        traces = probes.reasoning_traces(
+            BASE_MODEL, tokenizer, groups, budget=TRACE_BUDGET,
+            medium_effort=MEDIUM_EFFORT, batch_size=TRACE_BATCH_SIZE,
+            dtype=DTYPE, device_map=DEVICE_MAP, max_memory=MAX_MEMORY,
+            offload_dir=OFFLOAD_DIR, gpu_headroom=GPU_HEADROOM,
+            gpu_headroom_fraction=GPU_HEADROOM_FRACTION, cpu_limit=CPU_LIMIT,
+            keep_packed=KEEP_PACKED)
+
+    # One id sequence per prompt, built once. A prompt whose reasoning never
+    # reached `</think>` has no position to read and drops out of both classes'
+    # counts, which the per-class statistics below already allow for.
+    sequences = {}
+    for label, group in groups.items():
+        sequences[label], kept = probes.probe_sequences(
+            tokenizer, group, PROBE, traces[label], MEDIUM_EFFORT)
+        if len(kept) < len(group):
+            print(f"  {len(group) - len(kept)} {label} prompt(s) dropped: no "
+                  f"`</think>` within {TRACE_BUDGET} tokens")
+
+    batches = {label: [probes.pad_left(group[start:start + BATCH_SIZE],
+                                       tokenizer.pad_token_id)
                        for start in range(0, len(group), BATCH_SIZE)]
-               for label, group in groups.items()}
+               for label, group in sequences.items()}
     shapes = [tuple(inputs["input_ids"].shape)
               for group in batches.values() for inputs in group]
     workload_tokens = max(rows * columns for rows, columns in shapes)
@@ -177,6 +276,7 @@ def capture(model_id):
     torch.save({"model_id": model_id,
                 "fingerprint": fingerprint(harmful, harmless),
                 "prompts": PROMPTS,
+                "weights": weights_stamp(model_id),
                 "captured": captured}, path)
     print(f"Wrote {path} ({format_memory(path.stat().st_size)})")
 
@@ -232,21 +332,68 @@ def compare(base, ablated):
               f"{points[99]:>8.4f} {backward.mean().item():>14.4f} "
               f"{agree:>10.1%} {delta.mean().item():>+15.4f}")
 
+    # What the two models actually want to say first. The KL says how far the
+    # distributions moved; this says whether what moved was the refusal, which
+    # is the only reason to run any of this.
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)
+    print()
+    for label in ("harmful", "harmless"):
+        for which, cache in (("base   ", base), ("ablated", ablated)):
+            counts = Counter(
+                tokenizer.decode([token]) for token in
+                cache["captured"][label]["next_token"].argmax(-1).tolist())
+            top = ", ".join(f"{text!r} x{count}"
+                            for text, count in counts.most_common(4))
+            print(f"  first token, {label:>8} prompts, {which}: {top}")
+
     harmful_kl, harmless_kl = summary["harmful"][0], summary["harmless"][0]
     ratio = harmful_kl / harmless_kl if harmless_kl > 1e-12 else float("inf")
     print(f"\nHarmful/harmless KL ratio: {ratio:.1f}x")
+    if PROBE != "answer":
+        print(f"  Read that with PROBE = {PROBE!r} in mind: it is not a number "
+              "about the ablation yet.")
+        if PROBE == "close":
+            print("  This position is *after* the model's own reasoning, and no "
+                  "ablation tried has ever moved it -- the harmful top-1 stays "
+                  "at 100% and the KL under 0.03 whatever the edit, because the "
+                  "refusal is already in the context as text. A checkpoint that "
+                  "reads 0.3x here read 46.3x at PROBE = \"answer\". Set it to "
+                  "\"answer\" before concluding anything; the column worth "
+                  "reading at this position is the prompt log-probability "
+                  "below, which covers the reasoning trace itself.")
+        else:
+            print("  This position is before the model has decided anything, "
+                  "where its next-token distribution is the same for both "
+                  "classes, so the harmful column cannot move. Set PROBE to "
+                  "\"answer\".")
     print("  An edit that went where it was aimed moves the next-token "
           "distribution on prompts the model used to refuse and leaves the rest "
           "alone, so this ratio is the one number here that says whether the "
           "ablation was surgical. 1x would mean the model changed everywhere "
           "equally, i.e. it was damaged rather than edited.")
+    print("  It only reads that way when the second model is an ablation of the "
+          "first. Comparing two *encodings* of the same model -- a quantized "
+          "build against the checkpoint it came from -- measures round-trip "
+          "damage instead, and there 1x is the expected answer: quantization "
+          "error has no reason to prefer one class of prompt.")
     print(f"\nPrompt log-probability: {summary['harmless'][3]:+.4f} nats per "
           f"token on harmless prompts ({summary['harmless'][4]:.4f} in absolute "
-          "value)")
+          f"value), {summary['harmful'][3]:+.4f} on harmful ones")
     print("  This is the model's ordinary language modelling, teacher-forced on "
           "text it was not asked to refuse. A drop of more than a few hundredths "
           "of a nat per token is collateral damage, whatever the refusal count "
           "says; near zero means the weights outside the direction survived.")
+    if PROBE == "close":
+        # The teacher-forced text is prompt + reasoning trace here, so this
+        # column stops being only a perplexity check and becomes the one place
+        # the edit is visible at this position.
+        print("  At PROBE = \"close\" the teacher-forced text includes the base "
+              "model's own reasoning, so the harmful figure is how much less "
+              "likely the ablated model finds a trace that reasons its way to a "
+              "refusal. That is the edit working, not damage: the 1024-prompt "
+              "\"close\" checkpoint reads -0.296 on harmful against -0.032 on "
+              "harmless, a 9x asymmetry, while its next-token column at this "
+              "position shows nothing at all.")
     print(f"\nTop-1 next token unchanged on {summary['harmless'][2]:.1%} of "
           f"harmless prompts and {summary['harmful'][2]:.1%} of harmful ones")
 
@@ -262,11 +409,16 @@ for model_id in (BASE_MODEL, ABLATED_MODEL):
     path = cache_path(model_id)
     if path.is_file():
         cached = torch.load(path, weights_only=False)
+        stamp = weights_stamp(model_id)
         if cached.get("fingerprint") == wanted and cached.get("prompts") == PROMPTS:
-            print(f"Reusing {path}")
-            caches[model_id] = cached
-            continue
-        print(f"{path} was built from a different prompt set; rebuilding it")
+            if cached.get("weights") == stamp:
+                print(f"Reusing {path}")
+                caches[model_id] = cached
+                continue
+            print(f"{path} was built from different weights at the same path; "
+                  "rebuilding it")
+        else:
+            print(f"{path} was built from a different prompt set; rebuilding it")
 
     # A child process, so that this one never holds two models' weights, and so
     # that the first model's memory is returned by the operating system rather

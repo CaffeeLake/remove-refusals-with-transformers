@@ -47,8 +47,9 @@ from transformers import AutoConfig
 from model_loading import (format_duration, format_memory,
                            ignore_dense_targets, leaf_pattern,
                            module_paths, narrow_targets, select_modules)
-MODEL_ID = "../Hy-Memory-30B-A3B"
-OUTPUT_DIR = "../Hy-Memory-30B-A3B-Abliterated"
+
+MODEL_ID = "../NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16"
+OUTPUT_DIR = "../NVIDIA-Nemotron-Labs-Dory1.0-4B-Abliterated"
 
 REFUSAL_DIR_PATH = MODEL_ID.replace("/", "_") + "_refusal_dir.pt"
 
@@ -110,7 +111,8 @@ WRITER_SUFFIXES = (
     "routed_expert_up_proj",
 )
 
-EMBEDDING_SUFFIXES = ("embed_tokens", "wte", "word_embeddings", "embed_in")
+EMBEDDING_SUFFIXES = ("embed_tokens", "wte", "word_embeddings", "embed_in",
+                      "embeddings")   # Dory
 
 PROJECTOR_HINTS = ("mm_projector", "multi_modal_projector", "projector")
 

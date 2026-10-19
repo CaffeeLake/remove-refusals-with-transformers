@@ -8,7 +8,7 @@ from model_loading import get_decoder_layers, get_input_device, load_model
 
 torch.inference_mode()
 
-MODEL_ID = "../Hy-Memory-30B-A3B"
+MODEL_ID = "../NVIDIA-Nemotron-Labs-Dory1.0-4B-Abliterated"
 # MODEL_ID = "tiiuae/Falcon3-1B-Instruct"
 # MODEL_ID = "Qwen/Qwen3-1.7B"
 # MODEL_ID = "stabilityai/stablelm-2-zephyr-1_6b"
@@ -40,7 +40,7 @@ OFFLOAD_DIR = None
 # Longest conversation that will be generated, prompt plus completion. This is
 # what the KV cache is sized from, so a value that is too small brings the OOM
 # back late in a long answer.
-MAX_NEW_TOKENS = 1337
+MAX_NEW_TOKENS = 2048
 WORKLOAD_TOKENS = 4096 + MAX_NEW_TOKENS
 # One conversation at a time, so the token count above is also the sequence
 # length. That matters because an eager attention matrix is quadratic in it:

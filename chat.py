@@ -23,7 +23,7 @@ from transformers import AutoTokenizer, TextStreamer
 
 from model_loading import get_input_device, load_model
 
-MODEL_ID = "../Hy-Memory-30B-A3B-Abliterated"
+MODEL_ID = "../NVIDIA-Nemotron-Labs-Dory1.0-4B-Abliterated"
 
 # "auto" follows the checkpoint. Forcing float16 on a bfloat16 model throws away
 # most of its exponent range.
@@ -42,7 +42,7 @@ OFFLOAD_DIR = None
 # cache and, on a model without flash-attention, the quadratic attention matrix
 # are both sized from this, so a value that is too small brings the OOM back
 # late in a long answer and one that is too large offloads weights for nothing.
-MAX_NEW_TOKENS = 1337
+MAX_NEW_TOKENS = 2048
 WORKLOAD_TOKENS = 4096 + MAX_NEW_TOKENS
 
 # VRAM to keep free per GPU for everything that is not weights. accelerate
